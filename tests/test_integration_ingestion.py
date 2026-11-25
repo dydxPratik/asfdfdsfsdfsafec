@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import openpyxl
 import pymupdf
 
 from src.ingestion.indexer import chunk_file, get_chroma_client, get_or_create_collection, ingest_directory
@@ -157,6 +158,56 @@ class TestIsolatedIngestionAndEdgeCases(unittest.TestCase):
         )
         self.assertEqual(len(hits), 1)
         self.assertIn("OMEGA-772", hits[0].text)
+
+    def test_multi_sheet_excel_workbook_ingestion_and_retrieval(self) -> None:
+        xlsx_path = self.data_dir / "company_budgets.xlsx"
+        wb = openpyxl.Workbook()
+
+        # Sheet 1: Regional Budgets
+        ws1 = wb.active
+        ws1.title = "Regional Budgets"
+        ws1.append(["cost_center", "hub", "annual_budget_usd", "owner"])
+        ws1.append(["CC-ZUR-90", "Zurich Lab", 450000, "Hannah Lindqvist"])
+        ws1.append(["CC-AUS-12", "Austin HQ", 620000, "Marcus Vance"])
+
+        # Sheet 2: Empty sheet (should be skipped cleanly)
+        wb.create_sheet("Blank Notes")
+
+        # Sheet 3: Hardware Inventory
+        ws3 = wb.create_sheet("Hardware Inventory")
+        ws3.append(["asset_tag", "model", "status"])
+        ws3.append(["AMR-HELIOS-88", "Helios-9", "Active Deployment"])
+
+        wb.save(xlsx_path)
+        wb.close()
+
+        report = ingest_directory(
+            data_dir=self.data_dir,
+            chroma_dir=self.chroma_dir,
+            corpus_path=self.corpus_path,
+            reset_index=True,
+        )
+        self.assertEqual(report.files_processed, ["company_budgets.xlsx"])
+        self.assertEqual(report.failed_files, {})
+        self.assertGreaterEqual(report.total_chunks_indexed, 2)
+
+        hits = hybrid_retrieve_and_rerank(
+            "What is the annual budget for cost center CC-ZUR-90 in Zurich Lab?",
+            chroma_dir=self.chroma_dir,
+            corpus_path=self.corpus_path,
+        )
+        self.assertGreaterEqual(len(hits), 1)
+        self.assertIn("450000", hits[0].text)
+        self.assertIn("Sheet 'Regional Budgets'", hits[0].page_or_section)
+
+        hits_sheet3 = hybrid_retrieve_and_rerank(
+            "What model is asset_tag AMR-HELIOS-88?",
+            chroma_dir=self.chroma_dir,
+            corpus_path=self.corpus_path,
+        )
+        self.assertGreaterEqual(len(hits_sheet3), 1)
+        self.assertIn("Helios-9", hits_sheet3[0].text)
+        self.assertIn("Sheet 'Hardware Inventory'", hits_sheet3[0].page_or_section)
 
 
 if __name__ == "__main__":

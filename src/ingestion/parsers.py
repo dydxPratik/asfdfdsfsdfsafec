@@ -1,4 +1,4 @@
-"""Multi-format company document parsers (.pdf via pymupdf, .md, .txt, .csv via stdlib)."""
+"""Multi-format company document parsers (.pdf via pymupdf, .xlsx/.xlsm via openpyxl, .md/.txt/.csv via stdlib)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,9 @@ import csv
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
+import openpyxl
 import pymupdf
 
 from src.config import SUPPORTED_EXTENSIONS
@@ -117,59 +119,135 @@ def parse_txt(file_path: Path) -> list[ParsedSection]:
     return sections
 
 
+def _format_row_label(start_row: int, end_row: int, sheet_name: str | None = None) -> str:
+    """Format a human-readable row range label, optionally scoped to an Excel sheet."""
+    row_part = f"Row {start_row}" if start_row == end_row else f"Rows {start_row}-{end_row}"
+    if sheet_name:
+        return f"Sheet '{sheet_name}' ({row_part})"
+    return row_part
+
+
+def _batch_tabular_rows(
+    source_name: str,
+    rows: Iterable[tuple[int, dict[str, str]]],
+    rows_per_section: int = 3,
+    sheet_name: str | None = None,
+) -> list[ParsedSection]:
+    """Group tabular records into self-contained text blocks with explicit column names."""
+    sections: list[ParsedSection] = []
+    batch_lines: list[str] = []
+    batch_indices: list[int] = []
+    header_prefix = f"[Sheet: {sheet_name}]\n" if sheet_name else ""
+
+    for row_idx, row_dict in rows:
+        kv_pairs = [
+            f"{col}: {val}"
+            for col, val in row_dict.items()
+            if col and val
+        ]
+        if not kv_pairs:
+            continue
+        batch_lines.append(f"Record {row_idx} -> " + " | ".join(kv_pairs))
+        batch_indices.append(row_idx)
+
+        if len(batch_lines) >= rows_per_section:
+            sections.append(
+                ParsedSection(
+                    source_file=source_name,
+                    page_or_section=_format_row_label(batch_indices[0], batch_indices[-1], sheet_name),
+                    text=header_prefix + "\n".join(batch_lines),
+                )
+            )
+            batch_lines = []
+            batch_indices = []
+
+    if batch_lines:
+        sections.append(
+            ParsedSection(
+                source_file=source_name,
+                page_or_section=_format_row_label(batch_indices[0], batch_indices[-1], sheet_name),
+                text=header_prefix + "\n".join(batch_lines),
+            )
+        )
+
+    return sections
+
+
 def parse_csv(file_path: Path, rows_per_section: int = 3) -> list[ParsedSection]:
     """Serialize CSV rows with explicit column headers so every chunk remains self-contained."""
     source_name = file_path.name
-    sections: list[ParsedSection] = []
-
     with file_path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
         reader = csv.DictReader(handle)
         if not reader.fieldnames:
             return []
 
-        batch_lines: list[str] = []
-        batch_start_row = 1
+        cleaned_rows = (
+            (
+                row_idx,
+                {
+                    col.strip(): (val or "").strip()
+                    for col, val in row.items()
+                    if col is not None
+                },
+            )
+            for row_idx, row in enumerate(reader, start=1)
+        )
+        return _batch_tabular_rows(
+            source_name=source_name,
+            rows=cleaned_rows,
+            rows_per_section=rows_per_section,
+        )
 
-        for row_idx, row in enumerate(reader, start=1):
-            kv_pairs = [
-                f"{col.strip()}: {(val or '').strip()}"
-                for col, val in row.items()
-                if col is not None and (val or "").strip() != ""
-            ]
-            if not kv_pairs:
+
+def parse_excel(file_path: Path, rows_per_section: int = 3) -> list[ParsedSection]:
+    """Parse multi-sheet Excel (.xlsx/.xlsm) workbooks into header-annotated sections."""
+    source_name = file_path.name
+    sections: list[ParsedSection] = []
+    workbook = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+    try:
+        for sheet_name in workbook.sheetnames:
+            sheet = workbook[sheet_name]
+            row_iter = sheet.iter_rows(values_only=True)
+
+            # Locate the first non-empty row as column headers
+            headers: list[str] = []
+            for raw_row in row_iter:
+                if raw_row and any(cell is not None and str(cell).strip() != "" for cell in raw_row):
+                    headers = [
+                        str(cell).strip() if cell is not None and str(cell).strip() else f"Column_{idx + 1}"
+                        for idx, cell in enumerate(raw_row)
+                    ]
+                    break
+
+            if not headers:
                 continue
-            batch_lines.append(f"Record {row_idx} -> " + " | ".join(kv_pairs))
 
-            if len(batch_lines) >= rows_per_section:
-                row_label = (
-                    f"Row {batch_start_row}"
-                    if batch_start_row == row_idx
-                    else f"Rows {batch_start_row}-{row_idx}"
-                )
-                sections.append(
-                    ParsedSection(
-                        source_file=source_name,
-                        page_or_section=row_label,
-                        text="\n".join(batch_lines),
-                    )
-                )
-                batch_lines = []
-                batch_start_row = row_idx + 1
+            tabular_rows: list[tuple[int, dict[str, str]]] = []
+            for row_idx, raw_row in enumerate(row_iter, start=1):
+                if not raw_row:
+                    continue
+                row_dict: dict[str, str] = {}
+                for col_idx, cell in enumerate(raw_row):
+                    if cell is None:
+                        continue
+                    cell_str = str(cell).strip()
+                    if not cell_str:
+                        continue
+                    col_name = headers[col_idx] if col_idx < len(headers) else f"Column_{col_idx + 1}"
+                    row_dict[col_name] = cell_str
+                if row_dict:
+                    tabular_rows.append((row_idx, row_dict))
 
-        if batch_lines:
-            end_row = batch_start_row + len(batch_lines) - 1
-            row_label = (
-                f"Row {batch_start_row}"
-                if batch_start_row == end_row
-                else f"Rows {batch_start_row}-{end_row}"
-            )
-            sections.append(
-                ParsedSection(
-                    source_file=source_name,
-                    page_or_section=row_label,
-                    text="\n".join(batch_lines),
+            sections.extend(
+                _batch_tabular_rows(
+                    source_name=source_name,
+                    rows=tabular_rows,
+                    rows_per_section=rows_per_section,
+                    sheet_name=sheet_name,
                 )
             )
+    finally:
+        workbook.close()
 
     return sections
 
@@ -187,4 +265,6 @@ def parse_file(file_path: Path) -> list[ParsedSection]:
         return parse_txt(file_path)
     if suffix == ".csv":
         return parse_csv(file_path)
+    if suffix in (".xlsx", ".xlsm"):
+        return parse_excel(file_path)
     raise ValueError(f"Unhandled extension: {suffix}")

@@ -30,7 +30,7 @@ RRF_K: int = 60
 RERANK_TOP_N: int = 6
 
 # Supported file extensions
-SUPPORTED_EXTENSIONS: tuple[str, ...] = (".pdf", ".md", ".txt", ".csv")
+SUPPORTED_EXTENSIONS: tuple[str, ...] = (".pdf", ".md", ".txt", ".csv", ".xlsx", ".xlsm")
 
 # Active Groq LLM models (verified live via Groq models.list API)
 DEFAULT_GROQ_MODEL: str = "openai/gpt-oss-120b"

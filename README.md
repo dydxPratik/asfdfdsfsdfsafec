@@ -9,7 +9,7 @@ Production-grade, zero-hallucination Retrieval-Augmented Generation (RAG) system
 - **Hybrid Search:** Dense Cosine + `rank-bm25` (`BM25Okapi`) fused via **Reciprocal Rank Fusion (RRF)**
 - **Local Reranker:** `flashrank` (`ms-marco-MiniLM-L-12-v2` quantized ONNX on CPU)
 - **Grounded Generation:** `groq` SDK + strict `pydantic` schema (`answer`, `citations`, `is_supported`, `confidence`)
-- **Document Parsers:** `pymupdf` (`.pdf`), Python stdlib (`.md`, `.txt`, `.csv`)
+- **Document Parsers:** `pymupdf` (`.pdf`), `openpyxl` (`.xlsx`, `.xlsm`), Python stdlib (`.md`, `.txt`, `.csv`)
 - **UI:** `streamlit` (`app.py`) with drag-and-drop upload, one-click re-indexing, and **Sources & Retrieval Debug** inspector
 
 ## Quick Start (PowerShell)
