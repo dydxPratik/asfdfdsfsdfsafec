@@ -1,0 +1,261 @@
+[
+  {
+    "id": "RET-01",
+    "category": "1_exact_keyword",
+    "query": "POL-EXP-402 VaultSpend 21 calendar days",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hr_expense_policy.md"],
+    "relevant_chunks": ["nexavault_hr_expense_policy.md::chunk_0003_a31cbec67e"],
+    "expected_facts": ["VaultSpend", "21 calendar days", "$25.00 USD"]
+  },
+  {
+    "id": "RET-02",
+    "category": "1_exact_keyword",
+    "query": "employee_id NV-EMP-1042",
+    "answerable": true,
+    "relevant_docs": ["employee_directory.csv"],
+    "relevant_chunks": ["employee_directory.csv::chunk_0001_cb9bbe3bd9"],
+    "expected_facts": ["Priya Nair", "Director of People Operations", "Bengaluru R&D Center"]
+  },
+  {
+    "id": "RET-03",
+    "category": "2_partial_keyword",
+    "query": "RMA-NV barcode crate",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hardware_warranty.pdf"],
+    "relevant_chunks": ["nexavault_hardware_warranty.pdf::chunk_0002_3a771e8ba1"],
+    "expected_facts": ["RMA-NV-77", "rma.nexavault.internal", "outer antistatic crate"]
+  },
+  {
+    "id": "RET-04",
+    "category": "2_partial_keyword",
+    "query": "VaultKeeper 45 days rotation",
+    "answerable": true,
+    "relevant_docs": ["it_security_runbook.txt"],
+    "relevant_chunks": ["it_security_runbook.txt::chunk_0001_e1fc56f223"],
+    "expected_facts": ["45 days", "VaultKeeper KMS", "90 seconds"]
+  },
+  {
+    "id": "RET-05",
+    "category": "3_semantic_paraphrase",
+    "query": "How much money can I spend per night on a hotel room when visiting Tokyo for work?",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hr_expense_policy.md"],
+    "relevant_chunks": ["nexavault_hr_expense_policy.md::chunk_0004_3cd43b85e3"],
+    "expected_facts": ["$340 USD / night", "Tier 1 Cities", "Tokyo"]
+  },
+  {
+    "id": "RET-06",
+    "category": "3_semantic_paraphrase",
+    "query": "What happens if someone accidentally commits a secret token into a source code repo?",
+    "answerable": true,
+    "relevant_docs": ["it_security_runbook.txt"],
+    "relevant_chunks": ["it_security_runbook.txt::chunk_0001_e1fc56f223"],
+    "expected_facts": ["automatic P1 revocation within 90 seconds"]
+  },
+  {
+    "id": "RET-07",
+    "category": "4_synonyms",
+    "query": "Allowance for buying a standing desk or computer screen as a newly onboarded staff member",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hr_expense_policy.md"],
+    "relevant_chunks": ["nexavault_hr_expense_policy.md::chunk_0005_e774107a79"],
+    "expected_facts": ["$750 USD", "30 days", "standing desk converters", "external monitors"]
+  },
+  {
+    "id": "RET-08",
+    "category": "4_synonyms",
+    "query": "Paid baby bonding vacation duration for new mothers and fathers",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hr_expense_policy.md"],
+    "relevant_chunks": ["nexavault_hr_expense_policy.md::chunk_0006_7d42c50929"],
+    "expected_facts": ["16 weeks", "100% paid parental leave", "12 months"]
+  },
+  {
+    "id": "RET-09",
+    "category": "5_sentence_structure",
+    "query": "For SSH into production robot clusters, SMS two-factor is banned—what physical key is required instead?",
+    "answerable": true,
+    "relevant_docs": ["it_security_runbook.txt"],
+    "relevant_chunks": ["it_security_runbook.txt::chunk_0001_e1fc56f223"],
+    "expected_facts": ["YubiKey 5C NFC", "prod-helios-eu", "prod-titan-us"]
+  },
+  {
+    "id": "RET-10",
+    "category": "6_multi_document",
+    "query": "Who is the CISO in the employee directory and what email must be notified within 30 minutes of a SEV-1 breach?",
+    "answerable": true,
+    "relevant_docs": ["employee_directory.csv", "it_security_runbook.txt"],
+    "relevant_chunks": [
+      "employee_directory.csv::chunk_0000_4e9dec2c40",
+      "it_security_runbook.txt::chunk_0002_c60ce7e3df"
+    ],
+    "expected_facts": ["Marcus Vance", "ciso@nexavault.internal", "30 minutes"]
+  },
+  {
+    "id": "RET-11",
+    "category": "6_multi_document",
+    "query": "Which engineer works on PRJ-TITAN-4 and how long is the Titan-4 robot hardware warranty?",
+    "answerable": true,
+    "relevant_docs": ["employee_directory.csv", "nexavault_hardware_warranty.pdf"],
+    "relevant_chunks": [
+      "employee_directory.csv::chunk_0003_3f0eeec5e9",
+      "nexavault_hardware_warranty.pdf::chunk_0000_ce7156b4ef"
+    ],
+    "expected_facts": ["Mateo Silva", "36-month"]
+  },
+  {
+    "id": "RET-12",
+    "category": "7_multi_section_same_doc",
+    "query": "Compare the annual PTO days in year 2 versus the paid sabbatical after 7 years of service",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hr_expense_policy.md"],
+    "relevant_chunks": [
+      "nexavault_hr_expense_policy.md::chunk_0006_7d42c50929",
+      "nexavault_hr_expense_policy.md::chunk_0007_d9b38e2f65"
+    ],
+    "expected_facts": ["22 days", "4-week paid sabbatical", "7 years"]
+  },
+  {
+    "id": "RET-13",
+    "category": "7_multi_section_same_doc",
+    "query": "In a SEV-2 stolen laptop incident, what is both the triage SLA and the Kandji remote-wipe deadline?",
+    "answerable": true,
+    "relevant_docs": ["it_security_runbook.txt"],
+    "relevant_chunks": [
+      "it_security_runbook.txt::chunk_0002_c60ce7e3df",
+      "it_security_runbook.txt::chunk_0003_761e25b943"
+    ],
+    "expected_facts": ["within 1 hour", "within 2 hours of report"]
+  },
+  {
+    "id": "RET-14",
+    "category": "8_numbers_dates_tech",
+    "query": "What is the kWh nameplate capacity and cycle count threshold in Clause BAT-80 effective February 1, 2026?",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hardware_warranty.pdf"],
+    "relevant_chunks": ["nexavault_hardware_warranty.pdf::chunk_0000_ce7156b4ef"],
+    "expected_facts": ["4.8 kWh", "3,500 charge cycles", "80%"]
+  },
+  {
+    "id": "RET-15",
+    "category": "8_numbers_dates_tech",
+    "query": "Which floor slope angle in degrees or water depth in mm voids the actuator warranty?",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hardware_warranty.pdf"],
+    "relevant_chunks": ["nexavault_hardware_warranty.pdf::chunk_0001_67c5317dbb"],
+    "expected_facts": ["12 degrees", "40 millimeters"]
+  },
+  {
+    "id": "RET-16",
+    "category": "9_spelling_mistakes",
+    "query": "ergonmic home ofice stipnd moniter keybord",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hr_expense_policy.md"],
+    "relevant_chunks": ["nexavault_hr_expense_policy.md::chunk_0005_e774107a79"],
+    "expected_facts": ["$750 USD", "external monitors", "mechanical keyboards"]
+  },
+  {
+    "id": "RET-17",
+    "category": "9_spelling_mistakes",
+    "query": "Platinm autonomus care price per site",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hardware_warranty.pdf"],
+    "relevant_chunks": ["nexavault_hardware_warranty.pdf::chunk_0002_3a771e8ba1"],
+    "expected_facts": ["$29,000 USD / site / year"]
+  },
+  {
+    "id": "RET-18",
+    "category": "10_ambiguous",
+    "query": "days limit",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hr_expense_policy.md"],
+    "relevant_chunks": [
+      "nexavault_hr_expense_policy.md::chunk_0002_f5ad0d5438",
+      "nexavault_hr_expense_policy.md::chunk_0003_a31cbec67e",
+      "nexavault_hr_expense_policy.md::chunk_0006_7d42c50929"
+    ],
+    "expected_facts": ["20", "21 calendar days", "22 days"]
+  },
+  {
+    "id": "RET-19",
+    "category": "11_very_short",
+    "query": "SAB-7YR",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hr_expense_policy.md"],
+    "relevant_chunks": ["nexavault_hr_expense_policy.md::chunk_0007_d9b38e2f65"],
+    "expected_facts": ["7 years", "4-week paid sabbatical"]
+  },
+  {
+    "id": "RET-20",
+    "category": "11_very_short",
+    "query": "@hlindqvist",
+    "answerable": true,
+    "relevant_docs": ["employee_directory.csv"],
+    "relevant_chunks": ["employee_directory.csv::chunk_0002_fa51602970"],
+    "expected_facts": ["Hannah Lindqvist", "Senior Finance Controller", "Zurich Lab"]
+  },
+  {
+    "id": "RET-21",
+    "category": "12_long_detailed",
+    "query": "Suppose I am a Grade L5 robotics software engineer based out of the Bengaluru R&D Center who wants to apply for a permanent fully remote work arrangement instead of coming in Tuesday through Thursday; which exact form code do I need and which two leadership roles must sign off?",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hr_expense_policy.md"],
+    "relevant_chunks": ["nexavault_hr_expense_policy.md::chunk_0001_611305fbce"],
+    "expected_facts": ["FORM-REM-09", "VP-level Engineering Lead", "Director of People Operations"]
+  },
+  {
+    "id": "RET-22",
+    "category": "13_irrelevant_distractor",
+    "query": "Yesterday it rained heavily in Seattle while I was drinking espresso and watching football, anyway what is the maximum number of unused PTO days that carry over and when do they expire?",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hr_expense_policy.md"],
+    "relevant_chunks": ["nexavault_hr_expense_policy.md::chunk_0006_7d42c50929"],
+    "expected_facts": ["8 days", "March 31"]
+  },
+  {
+    "id": "RET-23",
+    "category": "14_different_terminology",
+    "query": "Can engineers paste internal kinematics code into public AI assistants like ChatGPT, and what internal portals are permitted instead?",
+    "answerable": true,
+    "relevant_docs": ["it_security_runbook.txt"],
+    "relevant_chunks": ["it_security_runbook.txt::chunk_0004_de186b10ea"],
+    "expected_facts": ["nv-kinematics-core", "NexaVault Local RAG Workbench", "helios-llm.nexavault.internal"]
+  },
+  {
+    "id": "RET-24",
+    "category": "14_different_terminology",
+    "query": "How many days per year can staff work from a foreign country remotely?",
+    "answerable": true,
+    "relevant_docs": ["nexavault_hr_expense_policy.md"],
+    "relevant_chunks": ["nexavault_hr_expense_policy.md::chunk_0002_f5ad0d5438"],
+    "expected_facts": ["20", "Work-From-Anywhere", "Approved Tax & Export Control List"]
+  },
+  {
+    "id": "RET-25",
+    "category": "15_unanswerable",
+    "query": "What is NexaVault Robotics' dental and vision insurance monthly premium for dependents?",
+    "answerable": false,
+    "relevant_docs": [],
+    "relevant_chunks": [],
+    "expected_facts": []
+  },
+  {
+    "id": "RET-26",
+    "category": "15_unanswerable",
+    "query": "What is CEO Alexander Sterling's annual base salary and stock option cliff?",
+    "answerable": false,
+    "relevant_docs": [],
+    "relevant_chunks": [],
+    "expected_facts": []
+  },
+  {
+    "id": "RET-27",
+    "category": "15_unanswerable",
+    "query": "What is the maximum payload weight in kilograms of the Helios-9 warehouse robot?",
+    "answerable": false,
+    "relevant_docs": [],
+    "relevant_chunks": [],
+    "expected_facts": []
+  }
+]
