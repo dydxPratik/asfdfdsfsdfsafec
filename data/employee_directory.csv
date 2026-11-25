@@ -1,0 +1,7 @@
+employee_id,full_name,role,department,hub_location,project_code,clearance_tier,slack_handle
+NV-EMP-1001,Dr. Elena Rostova,VP of Autonomous Systems,Robotics Engineering,Zurich Lab,PRJ-HELIOS-9,Tier-4-Restricted,@erostova
+NV-EMP-1018,Marcus Vance,Chief Information Security Officer,Information Security,Austin HQ,SEC-ZERO-TRUST,Tier-4-Restricted,@mvance
+NV-EMP-1042,Priya Nair,Director of People Operations,People Operations,Bengaluru R&D Center,OPS-HYBRID-26,Tier-3-Confidential,@pnair
+NV-EMP-1089,Devon Brooks,Staff Firmware Architect,Robotics Engineering,Austin HQ,PRJ-HELIOS-9,Tier-4-Restricted,@dbrooks
+NV-EMP-1104,Hannah Lindqvist,Senior Finance Controller,Finance & Accounting,Zurich Lab,FIN-VAULTSPEND,Tier-3-Confidential,@hlindqvist
+NV-EMP-1155,Mateo Silva,Lead Fleet Reliability Engineer,Field Operations,Austin HQ,PRJ-TITAN-4,Tier-2-Internal,@msilva
