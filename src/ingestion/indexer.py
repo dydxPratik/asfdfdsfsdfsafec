@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
@@ -101,6 +101,7 @@ class IngestionReport:
     chroma_count: int
     bm25_doc_count: int
     embedding_dim: int
+    failed_files: dict[str, str] = field(default_factory=dict)
 
 
 def load_bm25_index(
@@ -141,11 +142,23 @@ def ingest_directory(
 
     all_chunks: list[DocumentChunk] = []
     chunks_per_file: dict[str, int] = {}
+    succeeded_files: list[str] = []
+    failed_files: dict[str, str] = {}
 
     for file_path in files:
-        file_chunks = chunk_file(file_path, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        try:
+            file_chunks = chunk_file(file_path, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        except Exception as exc:
+            failed_files[file_path.name] = f"{type(exc).__name__}: {exc}"
+            continue
+        succeeded_files.append(file_path.name)
         chunks_per_file[file_path.name] = len(file_chunks)
         all_chunks.extend(file_chunks)
+
+    # When updating incrementally (reset_index=False), purge prior chunks of updated files in ChromaDB
+    if not reset_index and succeeded_files:
+        for fname in succeeded_files:
+            collection.delete(where={"source_file": fname})
 
     embedding_dim = 0
     if all_chunks:
@@ -182,7 +195,7 @@ def ingest_directory(
     else:
         # Merge with existing records if not resetting
         _, existing_records = load_bm25_index(corpus_path)
-        updated_files = {f.name for f in files}
+        updated_files = set(succeeded_files)
         kept_records = [r for r in existing_records if r["source_file"] not in updated_files]
         new_records = [
             {
@@ -203,10 +216,11 @@ def ingest_directory(
     bm25_count = len(loaded_records) if bm25_index is not None else 0
 
     return IngestionReport(
-        files_processed=[f.name for f in files],
+        files_processed=succeeded_files,
         chunks_per_file=chunks_per_file,
         total_chunks_indexed=len(all_chunks),
         chroma_count=collection.count(),
         bm25_doc_count=bm25_count,
         embedding_dim=embedding_dim,
+        failed_files=failed_files,
     )

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import BadRequestError, Groq
+from pydantic import ValidationError
 
 from src.config import DEFAULT_GROQ_MODEL, PROJECT_ROOT, RERANK_TOP_N
 from src.retrieval.hybrid_retriever import hybrid_retrieve_and_rerank
@@ -43,14 +46,42 @@ def get_groq_client() -> Groq:
     return Groq(api_key=api_key)
 
 
+def _sanitize_chunk_xml_body(text: str) -> str:
+    """Neutralize XML boundary breakout tags inside untrusted document chunks without mangling quotes."""
+    return (
+        text.replace("</chunk>", "&lt;/chunk&gt;")
+        .replace("<chunk", "&lt;chunk")
+        .replace("</retrieved_company_chunks>", "&lt;/retrieved_company_chunks&gt;")
+        .replace("<retrieved_company_chunks>", "&lt;retrieved_company_chunks&gt;")
+    )
+
+
+def _normalize_for_quote_match(text: str) -> str:
+    """Normalize typographic hyphens, non-breaking spaces, markdown formatting, and whitespace."""
+    cleaned = (
+        text.replace("\u2011", "-")
+        .replace("\u2010", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u202f", " ")
+        .replace("\u00a0", " ")
+        .replace("**", "")
+        .replace("`", "")
+    )
+    return re.sub(r"\s+", " ", cleaned).strip().lower()
+
+
 def format_chunks_for_prompt(chunks: list[RetrievedChunk]) -> str:
-    """Format reranked chunks with clear XML provenance boundaries for the LLM."""
+    """Format reranked chunks with escaped XML provenance boundaries for the LLM."""
     blocks: list[str] = []
     for idx, ch in enumerate(chunks, start=1):
+        safe_src = html.escape(ch.source_file, quote=True)
+        safe_loc = html.escape(ch.page_or_section, quote=True)
+        safe_body = _sanitize_chunk_xml_body(ch.text)
         blocks.append(
-            f'<chunk index="{idx}" source_file="{ch.source_file}" '
-            f'location="{ch.page_or_section}" rerank_score="{ch.rerank_score:.4f}">\n'
-            f"{ch.text}\n"
+            f'<chunk index="{idx}" source_file="{safe_src}" '
+            f'location="{safe_loc}" rerank_score="{ch.rerank_score:.4f}">\n'
+            f"{safe_body}\n"
             f"</chunk>"
         )
     return "<retrieved_company_chunks>\n" + "\n\n".join(blocks) + "\n</retrieved_company_chunks>"
@@ -86,25 +117,45 @@ def generate_grounded_answer(
         },
     ]
 
-    try:
-        completion = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.0,
-            max_completion_tokens=2048,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "rag_response",
-                    "strict": True,
-                    "schema": schema_dict,
+    parsed: RAGResponse | None = None
+    last_schema_err: Exception | None = None
+
+    # Attempt strict json_schema up to 2 tries (recovers from transient Groq json_validate_failed)
+    for _attempt in range(2):
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.0,
+                max_completion_tokens=4096,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "rag_response",
+                        "strict": True,
+                        "schema": schema_dict,
+                    },
                 },
-            },
-        )
-    except BadRequestError as exc:
-        # Fallback to json_object mode ONLY if a user-selected model does not support json_schema
-        if "json_schema" not in str(exc) and "response_format" not in str(exc):
-            raise
+            )
+            raw_content = completion.choices[0].message.content or ""
+            parsed = RAGResponse.model_validate_json(raw_content)
+            break
+        except (BadRequestError, ValidationError) as exc:
+            last_schema_err = exc
+            err_str = str(exc)
+            recoverable = (
+                isinstance(exc, ValidationError)
+                or "json_validate_failed" in err_str
+                or "json_schema" in err_str
+                or "response_format" in err_str
+            )
+            if not recoverable:
+                raise
+            # If model outright rejects json_schema, skip retry and go straight to json_object fallback
+            if "json_schema" in err_str or "response_format" in err_str:
+                break
+
+    if parsed is None:
         schema_prompt = (
             SYSTEM_PROMPT
             + "\n\nJSON SCHEMA TO FOLLOW EXACTLY:\n"
@@ -117,22 +168,34 @@ def generate_grounded_answer(
                 messages[1],
             ],
             temperature=0.0,
-            max_completion_tokens=1024,
+            max_completion_tokens=4096,
             response_format={"type": "json_object"},
         )
+        raw_content = completion.choices[0].message.content or ""
+        parsed = RAGResponse.model_validate_json(raw_content)
 
-    raw_content = completion.choices[0].message.content or ""
-    parsed = RAGResponse.model_validate_json(raw_content)
+    # Post-generation provenance enforcement (filename + normalized quote containment check)
+    texts_by_source: dict[str, list[str]] = {}
+    for ch in retrieved_chunks:
+        texts_by_source.setdefault(ch.source_file, []).append(_normalize_for_quote_match(ch.text))
 
-    # Post-generation provenance enforcement
-    valid_sources = {c.source_file for c in retrieved_chunks}
-    verified_citations: list[Citation] = [
-        cit for cit in parsed.citations if cit.source_file in valid_sources and cit.quote.strip()
-    ]
+    verified_citations: list[Citation] = []
+    for cit in parsed.citations:
+        norm_quote = _normalize_for_quote_match(cit.quote)
+        if not norm_quote or cit.source_file not in texts_by_source:
+            continue
+        source_blobs = texts_by_source[cit.source_file]
+        if any(norm_quote in blob for blob in source_blobs):
+            verified_citations.append(cit)
 
-    if not parsed.is_supported:
+    if not parsed.is_supported or not verified_citations:
+        fallback_answer = parsed.answer
+        if parsed.is_supported and not verified_citations:
+            fallback_answer = (
+                "This information could not be verified with an exact citation from the provided company documents."
+            )
         return RAGResponse(
-            answer=parsed.answer,
+            answer=fallback_answer,
             citations=[],
             is_supported=False,
             confidence="low",
@@ -141,7 +204,7 @@ def generate_grounded_answer(
     return RAGResponse(
         answer=parsed.answer,
         citations=verified_citations,
-        is_supported=parsed.is_supported,
+        is_supported=True,
         confidence=parsed.confidence,
     )
 

@@ -185,6 +185,9 @@ def main() -> None:
                     corpus_path=BM25_CORPUS_PATH,
                     reset_index=True,
                 )
+            if report.failed_files:
+                failed_summary = "; ".join(f"{k} ({v})" for k, v in report.failed_files.items())
+                st.warning(f"Skipped unreadable file(s): {failed_summary}")
             if saved_names:
                 st.success(
                     f"Saved {len(saved_names)} file(s) and indexed {report.total_chunks_indexed} chunks!"

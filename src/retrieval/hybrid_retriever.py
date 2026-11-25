@@ -99,6 +99,11 @@ def hybrid_retrieve_and_rerank(
     corpus_path: Path = BM25_CORPUS_PATH,
 ) -> list[RetrievedChunk]:
     """Run ChromaDB dense search + BM25 keyword search -> RRF fusion -> FlashRank reranking."""
+    if top_n <= 0:
+        raise ValueError("top_n must be a positive integer")
+    if dense_top_k <= 0 or bm25_top_k <= 0:
+        raise ValueError("dense_top_k and bm25_top_k must be positive integers")
+
     cleaned_query = query.strip()
     if not cleaned_query:
         return []

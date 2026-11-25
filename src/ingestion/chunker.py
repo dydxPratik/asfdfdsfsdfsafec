@@ -87,15 +87,28 @@ def recursive_split_text(
             if chunk_str:
                 chunks.append(chunk_str)
 
-            # Retain trailing pieces up to chunk_overlap characters
-            while current_pieces and (
-                current_len > chunk_overlap
-                or (current_len + piece_len > chunk_size and len(current_pieces) > 1)
+            # Retain trailing pieces up to chunk_overlap characters while keeping >=1 piece if possible
+            while len(current_pieces) > 1 and (
+                current_len > chunk_overlap or current_len + piece_len > chunk_size
             ):
                 removed = current_pieces.pop(0)
                 current_len -= len(removed)
 
-            # If a single leftover piece still prevents fitting the new piece, drop it
+            # If a single trailing piece exceeds chunk_overlap, slice a word-aligned trailing window
+            if len(current_pieces) == 1 and current_len > chunk_overlap:
+                tail = current_pieces[0][-chunk_overlap:]
+                space_idx = tail.find(" ")
+                if 0 <= space_idx < len(tail) - 1:
+                    tail = tail[space_idx + 1 :]
+                tail = tail.strip()
+                if tail and len(tail) + 1 + piece_len <= chunk_size:
+                    current_pieces = [tail + " "]
+                    current_len = len(current_pieces[0])
+                else:
+                    current_pieces.clear()
+                    current_len = 0
+
+            # Final guard if leftover overlap still prevents fitting the incoming piece
             if current_pieces and current_len + piece_len > chunk_size:
                 current_pieces.clear()
                 current_len = 0
