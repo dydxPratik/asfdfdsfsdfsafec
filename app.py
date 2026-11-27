@@ -162,7 +162,7 @@ def main() -> None:
         col_b.metric("Indexed Chunks", chunk_count)
 
         uploaded_files = st.file_uploader(
-            "Upload Company Files (.pdf, .md, .txt, .csv, .xlsx)",
+            "Upload Company Files (.pdf, .md, .txt, .csv, .xlsx, .png, .jpg, .webp)",
             type=[ext.lstrip(".") for ext in SUPPORTED_EXTENSIONS],
             accept_multiple_files=True,
             help="Files are saved locally to ./data and indexed locally into ChromaDB + BM25.",

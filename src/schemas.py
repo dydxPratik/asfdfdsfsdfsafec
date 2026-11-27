@@ -10,7 +10,9 @@ class ChunkMetadata(BaseModel):
     """Required metadata stored alongside every indexed chunk."""
 
     source_file: str = Field(..., description="Filename of the source company document")
-    page_or_section: str = Field(..., description="Page number (PDF), section header, or CSV row range")
+    source: str = Field(default="", description="Source filename alias for citation provenance")
+    file_type: str = Field(default="document", description="Source category: 'document' or 'image'")
+    page_or_section: str = Field(..., description="Page number (PDF), section header, or CSV/Excel/Image info")
     chunk_id: str = Field(..., description="Deterministic unique identifier for this chunk")
 
 

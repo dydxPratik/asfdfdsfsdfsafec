@@ -20,6 +20,7 @@ from src.config import (
     COLLECTION_NAME,
     DATA_DIR,
     EMBEDDING_MODEL_NAME,
+    IMAGE_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
 )
 from src.ingestion.chunker import make_chunk_id, recursive_split_text
@@ -69,6 +70,7 @@ def chunk_file(
 ) -> list[DocumentChunk]:
     """Parse a single file and split its sections into overlapping DocumentChunks."""
     sections = parse_file(file_path)
+    file_type = "image" if file_path.suffix.lower() in IMAGE_EXTENSIONS else "document"
     chunks: list[DocumentChunk] = []
     chunk_counter = 0
 
@@ -82,6 +84,8 @@ def chunk_file(
             chunk_id = make_chunk_id(section.source_file, chunk_counter, piece)
             meta = ChunkMetadata(
                 source_file=section.source_file,
+                source=section.source_file,
+                file_type=file_type,
                 page_or_section=section.page_or_section,
                 chunk_id=chunk_id,
             )

@@ -1,17 +1,21 @@
-"""Multi-format company document parsers (.pdf via pymupdf, .xlsx/.xlsm via openpyxl, .md/.txt/.csv via stdlib)."""
+"""Multi-format company document parsers (.pdf, .xlsx/.xlsm, .png/.jpg/.jpeg/.webp, .md, .txt, .csv)."""
 
 from __future__ import annotations
 
 import csv
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import openpyxl
+from PIL import Image, UnidentifiedImageError
 import pymupdf
+from rapidocr_onnxruntime import RapidOCR
 
-from src.config import SUPPORTED_EXTENSIONS
+from src.config import IMAGE_EXTENSIONS, SUPPORTED_EXTENSIONS
 
 
 @dataclass(frozen=True)
@@ -252,6 +256,121 @@ def parse_excel(file_path: Path, rows_per_section: int = 3) -> list[ParsedSectio
     return sections
 
 
+@lru_cache(maxsize=1)
+def get_ocr_engine() -> RapidOCR:
+    """Load and cache the local CPU RapidOCR ONNX engine."""
+    return RapidOCR()
+
+
+def _reconstruct_spatial_lines(ocr_results: list) -> str:
+    """Group OCR bounding boxes into top-to-bottom rows and left-to-right columns."""
+    items: list[tuple[float, float, float, float, str]] = []
+    heights: list[float] = []
+
+    for entry in ocr_results:
+        box, text, _conf = entry[0], str(entry[1]).strip(), entry[2]
+        if not text:
+            continue
+        xs = [float(pt[0]) for pt in box]
+        ys = [float(pt[1]) for pt in box]
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        y_mid = (y_min + y_max) / 2.0
+        h = max(1.0, y_max - y_min)
+        heights.append(h)
+        items.append((y_mid, x_min, x_max, h, text))
+
+    if not items:
+        return ""
+
+    median_h = float(np.median(heights)) if heights else 16.0
+    row_tol = max(10.0, median_h * 0.55)
+
+    # Sort top-to-bottom first, then group into horizontal rows
+    items.sort(key=lambda it: (it[0], it[1]))
+    rows: list[list[tuple[float, float, float, float, str]]] = []
+    for it in items:
+        if not rows or abs(it[0] - rows[-1][0][0]) > row_tol:
+            rows.append([it])
+        else:
+            rows[-1].append(it)
+
+    lines: list[str] = []
+    for row in rows:
+        row.sort(key=lambda it: it[1])
+        parts: list[str] = [row[0][4]]
+        prev_x_max = row[0][2]
+        for cell in row[1:]:
+            gap = cell[1] - prev_x_max
+            # Wide horizontal gap indicates separate table columns / chart labels
+            sep = " | " if gap >= max(24.0, median_h * 1.4) else " "
+            parts.append(sep + cell[4])
+            prev_x_max = max(prev_x_max, cell[2])
+        lines.append("".join(parts))
+
+    return "\n".join(lines)
+
+
+def _describe_text_free_image(rgb_arr: np.ndarray, width: int, height: int, fmt: str, mode: str) -> str:
+    """Generate a concise factual visual summary when an image has no readable OCR text."""
+    orientation = "landscape" if width > height else ("portrait" if height > width else "square")
+    mean_rgb = rgb_arr.mean(axis=(0, 1))
+    std_rgb = float(rgb_arr.std())
+    luma = float(0.299 * mean_rgb[0] + 0.587 * mean_rgb[1] + 0.114 * mean_rgb[2])
+    tone = "bright" if luma > 180 else ("dark" if luma < 75 else "mid-tone")
+    complexity = "uniform/minimal graphic" if std_rgb < 12.0 else "visual scene or text-free diagram"
+    return (
+        f"No readable text detected in this image ({orientation} {complexity}, {tone} palette, "
+        f"mean RGB ({int(mean_rgb[0])}, {int(mean_rgb[1])}, {int(mean_rgb[2])}), {width}x{height}px {fmt} {mode})."
+    )
+
+
+def parse_image(file_path: Path) -> list[ParsedSection]:
+    """Validate image headers via Pillow and extract spatially structured text via RapidOCR."""
+    if not file_path.exists() or file_path.stat().st_size == 0:
+        raise ValueError(f"Empty or missing image file: {file_path.name}")
+
+    allowed_formats = {"PNG", "JPEG", "WEBP"}
+    try:
+        with Image.open(file_path) as probe_img:
+            img_format = (probe_img.format or "").upper()
+            probe_img.verify()
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ValueError(f"Invalid or corrupted image '{file_path.name}': {exc}") from exc
+
+    if img_format not in allowed_formats:
+        raise ValueError(
+            f"Unsupported image header '{img_format}' in '{file_path.name}' (expected PNG/JPEG/WEBP)."
+        )
+
+    try:
+        with Image.open(file_path) as img:
+            width, height = img.size
+            mode = img.mode
+            rgb_arr = np.asarray(img.convert("RGB"))
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ValueError(f"Failed decoding image '{file_path.name}': {exc}") from exc
+
+    ocr_engine = get_ocr_engine()
+    ocr_results, _ = ocr_engine(rgb_arr)
+    extracted_text = _reconstruct_spatial_lines(ocr_results) if ocr_results else ""
+    alnum_count = sum(1 for ch in extracted_text if ch.isalnum())
+
+    header_line = f"[Image: {file_path.name} | Format: {img_format} | Dimensions: {width}x{height}px]"
+    if alnum_count < 3:
+        body = _describe_text_free_image(rgb_arr, width, height, img_format, mode)
+    else:
+        body = extracted_text
+
+    return [
+        ParsedSection(
+            source_file=file_path.name,
+            page_or_section=f"Image ({width}x{height} {img_format})",
+            text=f"{header_line}\n{body}",
+        )
+    ]
+
+
 def parse_file(file_path: Path) -> list[ParsedSection]:
     """Dispatch a file to the appropriate format parser."""
     suffix = file_path.suffix.lower()
@@ -267,4 +386,6 @@ def parse_file(file_path: Path) -> list[ParsedSection]:
         return parse_csv(file_path)
     if suffix in (".xlsx", ".xlsm"):
         return parse_excel(file_path)
+    if suffix in IMAGE_EXTENSIONS:
+        return parse_image(file_path)
     raise ValueError(f"Unhandled extension: {suffix}")
