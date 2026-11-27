@@ -12,7 +12,9 @@ from src.config import (
     BM25_CORPUS_PATH,
     BM25_TOP_K,
     CHROMA_DIR,
+    DEFAULT_EMBEDDING_PROFILE,
     DENSE_TOP_K,
+    EMBEDDING_PROFILES,
     FLASHRANK_CACHE_DIR,
     FLASHRANK_MODEL_NAME,
     RERANK_TOP_N,
@@ -97,6 +99,7 @@ def hybrid_retrieve_and_rerank(
     rrf_k: int = RRF_K,
     chroma_dir: Path = CHROMA_DIR,
     corpus_path: Path = BM25_CORPUS_PATH,
+    embedding_profile: str = DEFAULT_EMBEDDING_PROFILE,
 ) -> list[RetrievedChunk]:
     """Run ChromaDB dense search + BM25 keyword search -> RRF fusion -> FlashRank reranking."""
     if top_n <= 0:
@@ -114,10 +117,12 @@ def hybrid_retrieve_and_rerank(
     if total_docs == 0:
         return []
 
-    # 1. Dense Vector Search (BGE query instruction prefix + cosine similarity)
-    embedder = get_embedding_model()
+    # 1. Dense Vector Search (asymmetric query prefix + cosine similarity)
+    prof = EMBEDDING_PROFILES.get(embedding_profile, EMBEDDING_PROFILES[DEFAULT_EMBEDDING_PROFILE])
+    embedder = get_embedding_model(prof["model_name"])
+    q_prefix = prof.get("query_prefix", BGE_QUERY_PREFIX)
     query_embedding = embedder.encode(
-        BGE_QUERY_PREFIX + cleaned_query,
+        q_prefix + cleaned_query,
         show_progress_bar=False,
         convert_to_numpy=True,
         normalize_embeddings=True,

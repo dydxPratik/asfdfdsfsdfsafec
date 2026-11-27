@@ -22,9 +22,11 @@ from src.config import (
     CHUNK_SIZE,
     COLLECTION_NAME,
     DATA_DIR,
+    DEFAULT_EMBEDDING_PROFILE,
     DEFAULT_GROQ_MODEL,
     DENSE_TOP_K,
     EMBEDDING_MODEL_NAME,
+    EMBEDDING_PROFILES,
     FLASHRANK_MODEL_NAME,
     IMAGE_EXTENSIONS,
     RERANK_TOP_N,
@@ -43,14 +45,20 @@ from src.ingestion.indexer import (
     get_embedding_model,
     get_or_create_collection,
     load_bm25_index,
+    save_bm25_corpus,
     tokenize_for_bm25,
 )
-from src.ingestion.parsers import ParsedSection, parse_file
+from src.ingestion.parsers import ParsedSection, parse_file, validate_file_signature
 from src.retrieval.hybrid_retriever import get_reranker, reciprocal_rank_fusion
+from src.retrieval.tabular_sql import (
+    execute_tabular_sql_query,
+    load_tabular_connection,
+    should_route_to_tabular_sql,
+)
 from src.schemas import ChunkMetadata, Citation, DocumentChunk, RAGResponse, RetrievedChunk
 
 PARSER_LABELS: dict[str, str] = {
-    ".pdf": "PyMuPDF (pymupdf 2.1)",
+    ".pdf": "PyMuPDF (pymupdf 2.1) + RapidOCR fallback for scanned pages",
     ".md": "Markdown Heading Parser (stdlib re)",
     ".txt": "Section-Aware Text Parser (stdlib re)",
     ".csv": "Tabular CSV Row Serializer (stdlib csv)",
@@ -73,6 +81,7 @@ def execute_traced_ingestion(
     chunk_overlap: int = CHUNK_OVERLAP,
     reset_index: bool = True,
     uploaded_filenames: list[str] | None = None,
+    embedding_profile: str = DEFAULT_EMBEDDING_PROFILE,
 ) -> None:
     """Execute the actual ingestion pipeline while emitting live stage telemetry events."""
     run_t0 = time.perf_counter()
@@ -136,7 +145,11 @@ def execute_traced_ingestion(
                 except (UnidentifiedImageError, OSError, ValueError) as exc:
                     failed_files[fp.name] = f"{type(exc).__name__}: {exc}"
             else:
-                valid_doc_files.append(fp)
+                try:
+                    validate_file_signature(fp)
+                    valid_doc_files.append(fp)
+                except ValueError as exc:
+                    failed_files[fp.name] = f"ValueError: {exc}"
 
         manager.emit(
             run_id,
@@ -315,6 +328,9 @@ def execute_traced_ingestion(
         # 6. EMBEDDING GENERATION
         embeddings_list: list[list[float]] = []
         embedding_dim = 0
+        emb_prof = EMBEDDING_PROFILES.get(embedding_profile, EMBEDDING_PROFILES[DEFAULT_EMBEDDING_PROFILE])
+        active_emb_model = emb_prof["model_name"]
+        passage_prefix = emb_prof.get("passage_prefix", "")
         if not all_chunks:
             manager.emit(
                 run_id,
@@ -322,7 +338,7 @@ def execute_traced_ingestion(
                 "skipped",
                 "No non-empty chunks generated — embedding skipped",
                 duration_ms=0.0,
-                metadata={"model": EMBEDDING_MODEL_NAME, "vectors_generated": 0},
+                metadata={"model": active_emb_model, "vectors_generated": 0},
             )
         else:
             t0 = time.perf_counter()
@@ -330,11 +346,11 @@ def execute_traced_ingestion(
                 run_id,
                 "embedding_generation",
                 "running",
-                f"Encoding {len(all_chunks)} chunk(s) with {EMBEDDING_MODEL_NAME} on CPU...",
-                metadata={"model": EMBEDDING_MODEL_NAME, "chunks_processed": 0, "total_chunks": len(all_chunks)},
+                f"Encoding {len(all_chunks)} chunk(s) with {active_emb_model} on CPU...",
+                metadata={"model": active_emb_model, "chunks_processed": 0, "total_chunks": len(all_chunks)},
             )
-            embedder = get_embedding_model()
-            texts = [c.text for c in all_chunks]
+            embedder = get_embedding_model(active_emb_model)
+            texts = [passage_prefix + c.text if passage_prefix else c.text for c in all_chunks]
             batch_size = 32
             for start_idx in range(0, len(texts), batch_size):
                 batch = texts[start_idx : start_idx + batch_size]
@@ -444,8 +460,7 @@ def execute_traced_ingestion(
             ]
             bm25_records = kept + added
 
-        corpus_path.parent.mkdir(parents=True, exist_ok=True)
-        corpus_path.write_text(json.dumps(bm25_records, indent=2), encoding="utf-8")
+        save_bm25_corpus(bm25_records, corpus_path)
         bm25_idx, loaded_recs = load_bm25_index(corpus_path)
         bm25_count = len(loaded_recs) if bm25_idx is not None else 0
         total_tokens = sum(len(r["tokens"]) for r in loaded_recs)
@@ -496,6 +511,8 @@ def execute_traced_query(
     manager: RunManager,
     query: str,
     model: str = DEFAULT_GROQ_MODEL,
+    response_language: str = "Auto (Match Query)",
+    embedding_profile: str = DEFAULT_EMBEDDING_PROFILE,
     top_n: int = RERANK_TOP_N,
     dense_top_k: int = DENSE_TOP_K,
     bm25_top_k: int = BM25_TOP_K,
@@ -555,252 +572,349 @@ def execute_traced_query(
             )
             return
 
-        # 2. QUERY EMBEDDING
-        current_stage = "query_embedding"
+        # 1B. DUCKDB TABULAR SQL ROUTER (FOR CSV / EXCEL AGGREGATIONS)
+        current_stage = "tabular_sql"
         t0 = time.perf_counter()
-        manager.emit(run_id, "query_embedding", "running", f"Encoding query with {EMBEDDING_MODEL_NAME}...")
-        embedder = get_embedding_model()
-        prefixed_query = BGE_QUERY_PREFIX + cleaned_query
-        q_vec_np = embedder.encode(
-            prefixed_query,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-        )
-        q_vec_list = q_vec_np.tolist()
-        embed_ms = (time.perf_counter() - t0) * 1000.0
+        final_chunks: list[RetrievedChunk] = []
+        routed_to_sql = False
+        embed_ms = 0.0
+        dense_ms = 0.0
+        bm25_ms = 0.0
+        rrf_ms = 0.0
+        rerank_ms = 0.0
+        sql_ms = 0.0
 
-        manager.emit(
-            run_id,
-            "query_embedding",
-            "completed",
-            f"Encoded 384-d normalized query vector in {embed_ms:.1f} ms",
-            duration_ms=embed_ms,
-            metadata={
-                "model": EMBEDDING_MODEL_NAME,
-                "query_prefix": BGE_QUERY_PREFIX,
-                "dimensions": len(q_vec_list),
-                "vector_preview_first_8": [round(float(x), 5) for x in q_vec_list[:8]],
-            },
-        )
-
-        # 3. CHROMADB DENSE RETRIEVAL
-        current_stage = "dense_retrieval"
-        t0 = time.perf_counter()
-        manager.emit(run_id, "dense_retrieval", "running", f"Querying ChromaDB HNSW (top {dense_top_k})...")
-        n_dense = min(dense_top_k, total_docs)
-        chroma_res = collection.query(
-            query_embeddings=[q_vec_list],
-            n_results=n_dense,
-            include=["documents", "metadatas", "distances"],
-        )
-        dense_hits: list[dict[str, Any]] = []
-        if chroma_res["ids"] and chroma_res["ids"][0]:
-            for cid, doc_text, meta, dist in zip(
-                chroma_res["ids"][0],
-                chroma_res["documents"][0],
-                chroma_res["metadatas"][0],
-                chroma_res["distances"][0],
-            ):
-                dense_hits.append(
-                    {
-                        "chunk_id": cid,
-                        "text": doc_text,
-                        "source_file": meta["source_file"],
-                        "page_or_section": meta["page_or_section"],
-                        "dense_score": round(1.0 - float(dist), 4),
-                    }
+        tab_conn, tab_tables = load_tabular_connection(DATA_DIR)
+        try:
+            if should_route_to_tabular_sql(cleaned_query, tab_tables):
+                manager.emit(
+                    run_id,
+                    "tabular_sql",
+                    "running",
+                    f"Routing aggregation query to DuckDB SQL across {len(tab_tables)} tabular table(s)...",
                 )
-        dense_ms = (time.perf_counter() - t0) * 1000.0
-        manager.emit(
-            run_id,
-            "dense_retrieval",
-            "completed",
-            f"Retrieved {len(dense_hits)} dense candidate(s) (top cos={dense_hits[0]['dense_score'] if dense_hits else 0:.4f})",
-            duration_ms=dense_ms,
-            metadata={
-                "technique": "HNSW Cosine Similarity",
-                "requested_k": dense_top_k,
-                "retrieved_count": len(dense_hits),
-                "hits": [
-                    {
-                        "rank": idx,
-                        "chunk_id": h["chunk_id"],
-                        "source_file": h["source_file"],
-                        "page_or_section": h["page_or_section"],
-                        "cosine_score": h["dense_score"],
-                        "preview": h["text"][:220],
-                    }
-                    for idx, h in enumerate(dense_hits, start=1)
-                ],
-            },
-        )
+                try:
+                    sql_res = execute_tabular_sql_query(
+                        query=cleaned_query,
+                        conn=tab_conn,
+                        tables=tab_tables,
+                        groq_client=get_groq_client(),
+                        model=model,
+                    )
+                    sql_ms = (time.perf_counter() - t0) * 1000.0
+                    final_chunks = sql_res["chunks"]
+                    routed_to_sql = True
+                    manager.emit(
+                        run_id,
+                        "tabular_sql",
+                        "completed",
+                        f"Executed DuckDB SQL ({sql_res['row_count']} row(s) from {', '.join(sql_res['source_files'])})",
+                        duration_ms=sql_ms,
+                        metadata={
+                            "engine": "DuckDB In-Memory SQL (Read-Only Guard)",
+                            "sql_query": sql_res["sql_query"],
+                            "reasoning": sql_res["reasoning"],
+                            "source_files": sql_res["source_files"],
+                            "columns": sql_res["columns"],
+                            "rows": sql_res["rows"],
+                            "row_count": sql_res["row_count"],
+                            "available_tables": [
+                                {"table": t.table_name, "source_file": t.source_file, "rows": t.row_count}
+                                for t in tab_tables
+                            ],
+                        },
+                    )
+                    for skip_stage in (
+                        "query_embedding",
+                        "dense_retrieval",
+                        "bm25_retrieval",
+                        "rrf_fusion",
+                        "cross_encoder_rerank",
+                    ):
+                        manager.emit(
+                            run_id,
+                            skip_stage,
+                            "skipped",
+                            "Bypassed — answered deterministically via DuckDB SQL Router",
+                            duration_ms=0.0,
+                        )
+                except Exception as sql_exc:
+                    sql_ms = (time.perf_counter() - t0) * 1000.0
+                    manager.emit(
+                        run_id,
+                        "tabular_sql",
+                        "skipped",
+                        f"SQL fallback to Hybrid RAG ({type(sql_exc).__name__})",
+                        duration_ms=sql_ms,
+                    )
+            else:
+                manager.emit(
+                    run_id,
+                    "tabular_sql",
+                    "skipped",
+                    "No tabular aggregation intent — routed to Hybrid RAG",
+                    duration_ms=(time.perf_counter() - t0) * 1000.0,
+                )
+        finally:
+            tab_conn.close()
 
-        # 4. BM25 SPARSE KEYWORD RETRIEVAL
-        current_stage = "bm25_retrieval"
-        t0 = time.perf_counter()
-        manager.emit(run_id, "bm25_retrieval", "running", f"Scoring BM25Okapi lexical corpus (top {bm25_top_k})...")
-        bm25_hits: list[dict[str, Any]] = []
-        query_tokens = tokenize_for_bm25(cleaned_query)
-        bm25_index, corpus_records = load_bm25_index(corpus_path)
-
-        if bm25_index is not None and corpus_records and query_tokens:
-            scores = bm25_index.get_scores(query_tokens)
-            scored_indices = sorted(
-                [(idx, float(sc)) for idx, sc in enumerate(scores) if float(sc) > 0.0],
-                key=lambda pair: pair[1],
-                reverse=True,
+        if not routed_to_sql:
+            # 2. QUERY EMBEDDING
+            current_stage = "query_embedding"
+            t0 = time.perf_counter()
+            emb_prof = EMBEDDING_PROFILES.get(embedding_profile, EMBEDDING_PROFILES[DEFAULT_EMBEDDING_PROFILE])
+            active_emb_model = emb_prof["model_name"]
+            active_q_prefix = emb_prof.get("query_prefix", "")
+            manager.emit(run_id, "query_embedding", "running", f"Encoding query with {active_emb_model}...")
+            embedder = get_embedding_model(active_emb_model)
+            prefixed_query = active_q_prefix + cleaned_query
+            q_vec_np = embedder.encode(
+                prefixed_query,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
             )
-            for idx, sc in scored_indices[:bm25_top_k]:
-                rec = corpus_records[idx]
-                bm25_hits.append(
-                    {
-                        "chunk_id": rec["chunk_id"],
-                        "text": rec["text"],
-                        "source_file": rec["source_file"],
-                        "page_or_section": rec["page_or_section"],
-                        "bm25_score": round(sc, 4),
-                    }
-                )
-        bm25_ms = (time.perf_counter() - t0) * 1000.0
-        if not bm25_hits:
+            q_vec_list = q_vec_np.tolist()
+            embed_ms = (time.perf_counter() - t0) * 1000.0
+
             manager.emit(
                 run_id,
-                "bm25_retrieval",
-                "skipped",
-                "Zero lexical token overlap in BM25 corpus — relying on dense semantic candidates",
-                duration_ms=bm25_ms,
-                metadata={"query_tokens": query_tokens, "retrieved_count": 0, "hits": []},
-            )
-        else:
-            manager.emit(
-                run_id,
-                "bm25_retrieval",
+                "query_embedding",
                 "completed",
-                f"Matched {len(bm25_hits)} keyword candidate(s) (top bm25={bm25_hits[0]['bm25_score']:.4f})",
-                duration_ms=bm25_ms,
+                f"Encoded {len(q_vec_list)}-d normalized query vector in {embed_ms:.1f} ms",
+                duration_ms=embed_ms,
                 metadata={
-                    "technique": "BM25Okapi + Hyphen-Code Tokenizer",
-                    "query_tokens": query_tokens,
-                    "requested_k": bm25_top_k,
-                    "retrieved_count": len(bm25_hits),
+                    "model": active_emb_model,
+                    "embedding_profile": embedding_profile,
+                    "query_prefix": active_q_prefix,
+                    "dimensions": len(q_vec_list),
+                    "vector_preview_first_8": [round(float(x), 5) for x in q_vec_list[:8]],
+                },
+            )
+
+            # 3. CHROMADB DENSE RETRIEVAL
+            current_stage = "dense_retrieval"
+            t0 = time.perf_counter()
+            manager.emit(run_id, "dense_retrieval", "running", f"Querying ChromaDB HNSW (top {dense_top_k})...")
+            n_dense = min(dense_top_k, total_docs)
+            chroma_res = collection.query(
+                query_embeddings=[q_vec_list],
+                n_results=n_dense,
+                include=["documents", "metadatas", "distances"],
+            )
+            dense_hits: list[dict[str, Any]] = []
+            if chroma_res["ids"] and chroma_res["ids"][0]:
+                for cid, doc_text, meta, dist in zip(
+                    chroma_res["ids"][0],
+                    chroma_res["documents"][0],
+                    chroma_res["metadatas"][0],
+                    chroma_res["distances"][0],
+                ):
+                    dense_hits.append(
+                        {
+                            "chunk_id": cid,
+                            "text": doc_text,
+                            "source_file": meta["source_file"],
+                            "page_or_section": meta["page_or_section"],
+                            "dense_score": round(1.0 - float(dist), 4),
+                        }
+                    )
+            dense_ms = (time.perf_counter() - t0) * 1000.0
+            manager.emit(
+                run_id,
+                "dense_retrieval",
+                "completed",
+                f"Retrieved {len(dense_hits)} dense candidate(s) (top cos={dense_hits[0]['dense_score'] if dense_hits else 0:.4f})",
+                duration_ms=dense_ms,
+                metadata={
+                    "technique": "HNSW Cosine Similarity",
+                    "requested_k": dense_top_k,
+                    "retrieved_count": len(dense_hits),
                     "hits": [
                         {
                             "rank": idx,
                             "chunk_id": h["chunk_id"],
                             "source_file": h["source_file"],
                             "page_or_section": h["page_or_section"],
-                            "bm25_score": h["bm25_score"],
+                            "cosine_score": h["dense_score"],
                             "preview": h["text"][:220],
                         }
-                        for idx, h in enumerate(bm25_hits, start=1)
+                        for idx, h in enumerate(dense_hits, start=1)
                     ],
                 },
             )
 
-        # 5. RECIPROCAL RANK FUSION (RRF)
-        current_stage = "rrf_fusion"
-        t0 = time.perf_counter()
-        manager.emit(run_id, "rrf_fusion", "running", f"Fusing rankings via RRF (k={rrf_k})...")
-        fused_candidates = reciprocal_rank_fusion(dense_hits, bm25_hits, rrf_k=rrf_k)
-        both_matched = sum(1 for c in fused_candidates if c.dense_rank is not None and c.bm25_rank is not None)
-        rrf_ms = (time.perf_counter() - t0) * 1000.0
+            # 4. BM25 SPARSE KEYWORD RETRIEVAL
+            current_stage = "bm25_retrieval"
+            t0 = time.perf_counter()
+            manager.emit(run_id, "bm25_retrieval", "running", f"Scoring BM25Okapi lexical corpus (top {bm25_top_k})...")
+            bm25_hits: list[dict[str, Any]] = []
+            query_tokens = tokenize_for_bm25(cleaned_query)
+            bm25_index, corpus_records = load_bm25_index(corpus_path)
 
-        rrf_rank_by_id = {c.chunk_id: idx for idx, c in enumerate(fused_candidates, start=1)}
-        manager.emit(
-            run_id,
-            "rrf_fusion",
-            "completed",
-            f"Merged into {len(fused_candidates)} unique candidate(s) ({both_matched} dual-hit)",
-            duration_ms=rrf_ms,
-            metadata={
-                "formula": f"sum(1 / ({rrf_k} + rank))",
-                "rrf_k": rrf_k,
-                "dense_input_count": len(dense_hits),
-                "bm25_input_count": len(bm25_hits),
-                "unique_fused_count": len(fused_candidates),
-                "dual_retriever_overlap_count": both_matched,
-                "candidates": [
-                    {
-                        "rrf_rank": idx,
-                        "chunk_id": c.chunk_id,
-                        "source_file": c.source_file,
-                        "page_or_section": c.page_or_section,
-                        "rrf_score": c.rrf_score,
-                        "dense_rank": c.dense_rank,
-                        "bm25_rank": c.bm25_rank,
-                    }
-                    for idx, c in enumerate(fused_candidates, start=1)
-                ],
-            },
-        )
+            if bm25_index is not None and corpus_records and query_tokens:
+                scores = bm25_index.get_scores(query_tokens)
+                scored_indices = sorted(
+                    [(idx, float(sc)) for idx, sc in enumerate(scores) if float(sc) > 0.0],
+                    key=lambda pair: pair[1],
+                    reverse=True,
+                )
+                for idx, sc in scored_indices[:bm25_top_k]:
+                    rec = corpus_records[idx]
+                    bm25_hits.append(
+                        {
+                            "chunk_id": rec["chunk_id"],
+                            "text": rec["text"],
+                            "source_file": rec["source_file"],
+                            "page_or_section": rec["page_or_section"],
+                            "bm25_score": round(sc, 4),
+                        }
+                    )
+            bm25_ms = (time.perf_counter() - t0) * 1000.0
+            if not bm25_hits:
+                manager.emit(
+                    run_id,
+                    "bm25_retrieval",
+                    "skipped",
+                    "Zero lexical token overlap in BM25 corpus — relying on dense semantic candidates",
+                    duration_ms=bm25_ms,
+                    metadata={"query_tokens": query_tokens, "retrieved_count": 0, "hits": []},
+                )
+            else:
+                manager.emit(
+                    run_id,
+                    "bm25_retrieval",
+                    "completed",
+                    f"Matched {len(bm25_hits)} keyword candidate(s) (top bm25={bm25_hits[0]['bm25_score']:.4f})",
+                    duration_ms=bm25_ms,
+                    metadata={
+                        "technique": "BM25Okapi + Hyphen-Code Tokenizer",
+                        "query_tokens": query_tokens,
+                        "requested_k": bm25_top_k,
+                        "retrieved_count": len(bm25_hits),
+                        "hits": [
+                            {
+                                "rank": idx,
+                                "chunk_id": h["chunk_id"],
+                                "source_file": h["source_file"],
+                                "page_or_section": h["page_or_section"],
+                                "bm25_score": h["bm25_score"],
+                                "preview": h["text"][:220],
+                            }
+                            for idx, h in enumerate(bm25_hits, start=1)
+                        ],
+                    },
+                )
 
-        # 6. FLASHRANK CROSS-ENCODER RERANKING
-        current_stage = "cross_encoder_rerank"
-        t0 = time.perf_counter()
-        manager.emit(
-            run_id,
-            "cross_encoder_rerank",
-            "running",
-            f"Reranking {len(fused_candidates)} candidate(s) with {FLASHRANK_MODEL_NAME}...",
-        )
-        ranker = get_reranker()
-        cand_by_id = {c.chunk_id: c for c in fused_candidates}
-        passages = [{"id": c.chunk_id, "text": c.text} for c in fused_candidates]
-        reranked_all = ranker.rerank(RerankRequest(query=cleaned_query, passages=passages))
+            # 5. RECIPROCAL RANK FUSION (RRF)
+            current_stage = "rrf_fusion"
+            t0 = time.perf_counter()
+            manager.emit(run_id, "rrf_fusion", "running", f"Fusing rankings via RRF (k={rrf_k})...")
+            fused_candidates = reciprocal_rank_fusion(dense_hits, bm25_hits, rrf_k=rrf_k)
+            both_matched = sum(1 for c in fused_candidates if c.dense_rank is not None and c.bm25_rank is not None)
+            rrf_ms = (time.perf_counter() - t0) * 1000.0
 
-        final_chunks: list[RetrievedChunk] = []
-        rank_comparisons: list[dict[str, Any]] = []
-        for final_rank, item in enumerate(reranked_all, start=1):
-            ch = cand_by_id[item["id"]]
-            score_val = round(float(item["score"]), 4)
-            ch.rerank_score = score_val
-            prev_rrf_rank = rrf_rank_by_id[ch.chunk_id]
-            rank_comparisons.append(
-                {
-                    "final_rank": final_rank,
-                    "rrf_rank_before": prev_rrf_rank,
-                    "rank_delta": prev_rrf_rank - final_rank,
-                    "kept_in_top_n": final_rank <= top_n,
-                    "chunk_id": ch.chunk_id,
-                    "source_file": ch.source_file,
-                    "page_or_section": ch.page_or_section,
-                    "rerank_score": score_val,
-                    "rrf_score": ch.rrf_score,
-                    "dense_rank": ch.dense_rank,
-                    "dense_score": ch.dense_score,
-                    "bm25_rank": ch.bm25_rank,
-                    "bm25_score": ch.bm25_score,
-                    "text": ch.text,
-                }
+            rrf_rank_by_id = {c.chunk_id: idx for idx, c in enumerate(fused_candidates, start=1)}
+            manager.emit(
+                run_id,
+                "rrf_fusion",
+                "completed",
+                f"Merged into {len(fused_candidates)} unique candidate(s) ({both_matched} dual-hit)",
+                duration_ms=rrf_ms,
+                metadata={
+                    "formula": f"sum(1 / ({rrf_k} + rank))",
+                    "rrf_k": rrf_k,
+                    "dense_input_count": len(dense_hits),
+                    "bm25_input_count": len(bm25_hits),
+                    "unique_fused_count": len(fused_candidates),
+                    "dual_retriever_overlap_count": both_matched,
+                    "candidates": [
+                        {
+                            "rrf_rank": idx,
+                            "chunk_id": c.chunk_id,
+                            "source_file": c.source_file,
+                            "page_or_section": c.page_or_section,
+                            "rrf_score": c.rrf_score,
+                            "dense_rank": c.dense_rank,
+                            "bm25_rank": c.bm25_rank,
+                        }
+                        for idx, c in enumerate(fused_candidates, start=1)
+                    ],
+                },
             )
-            if final_rank <= top_n:
-                final_chunks.append(ch)
 
-        rerank_ms = (time.perf_counter() - t0) * 1000.0
-        manager.emit(
-            run_id,
-            "cross_encoder_rerank",
-            "completed",
-            f"Selected Top {len(final_chunks)} / {len(fused_candidates)} chunk(s) (top score={final_chunks[0].rerank_score if final_chunks else 0:.4f})",
-            duration_ms=rerank_ms,
-            metadata={
-                "model": FLASHRANK_MODEL_NAME,
-                "runtime": "ONNXRuntime CPU (max_length=512)",
-                "input_count": len(fused_candidates),
-                "output_count": len(final_chunks),
-                "comparisons": rank_comparisons,
-            },
-        )
+            # 6. FLASHRANK CROSS-ENCODER RERANKING
+            current_stage = "cross_encoder_rerank"
+            t0 = time.perf_counter()
+            manager.emit(
+                run_id,
+                "cross_encoder_rerank",
+                "running",
+                f"Reranking {len(fused_candidates)} candidate(s) with {FLASHRANK_MODEL_NAME}...",
+            )
+            ranker = get_reranker()
+            cand_by_id = {c.chunk_id: c for c in fused_candidates}
+            passages = [{"id": c.chunk_id, "text": c.text} for c in fused_candidates]
+            reranked_all = ranker.rerank(RerankRequest(query=cleaned_query, passages=passages))
+
+            final_chunks: list[RetrievedChunk] = []
+            rank_comparisons: list[dict[str, Any]] = []
+            for final_rank, item in enumerate(reranked_all, start=1):
+                ch = cand_by_id[item["id"]]
+                score_val = round(float(item["score"]), 4)
+                ch.rerank_score = score_val
+                prev_rrf_rank = rrf_rank_by_id[ch.chunk_id]
+                rank_comparisons.append(
+                    {
+                        "final_rank": final_rank,
+                        "rrf_rank_before": prev_rrf_rank,
+                        "rank_delta": prev_rrf_rank - final_rank,
+                        "kept_in_top_n": final_rank <= top_n,
+                        "chunk_id": ch.chunk_id,
+                        "source_file": ch.source_file,
+                        "page_or_section": ch.page_or_section,
+                        "rerank_score": score_val,
+                        "rrf_score": ch.rrf_score,
+                        "dense_rank": ch.dense_rank,
+                        "dense_score": ch.dense_score,
+                        "bm25_rank": ch.bm25_rank,
+                        "bm25_score": ch.bm25_score,
+                        "text": ch.text,
+                    }
+                )
+                if final_rank <= top_n:
+                    final_chunks.append(ch)
+
+            rerank_ms = (time.perf_counter() - t0) * 1000.0
+            manager.emit(
+                run_id,
+                "cross_encoder_rerank",
+                "completed",
+                f"Selected Top {len(final_chunks)} / {len(fused_candidates)} chunk(s) (top score={final_chunks[0].rerank_score if final_chunks else 0:.4f})",
+                duration_ms=rerank_ms,
+                metadata={
+                    "model": FLASHRANK_MODEL_NAME,
+                    "runtime": "ONNXRuntime CPU (max_length=512)",
+                    "input_count": len(fused_candidates),
+                    "output_count": len(final_chunks),
+                    "comparisons": rank_comparisons,
+                },
+            )
 
         # 7. CONTEXT ASSEMBLY
         current_stage = "context_assembly"
         t0 = time.perf_counter()
         manager.emit(run_id, "context_assembly", "running", "Assembling XML-escaped prompt context...")
         context_xml = format_chunks_for_prompt(final_chunks)
+        lang_instruction = (
+            f"Write the 'answer' in {response_language} (keeping 'citations[].quote' verbatim from the source text)."
+            if response_language and not response_language.lower().startswith("auto")
+            else "Write the 'answer' in the same language as the User Question (keeping 'citations[].quote' verbatim from the source text)."
+        )
         user_msg_content = (
             f"{context_xml}\n\n"
-            f"User Question: {cleaned_query}\n\n"
+            f"User Question: {cleaned_query}\n"
+            f"Language Directive: {lang_instruction}\n\n"
             "Respond strictly in JSON matching the RAGResponse schema."
         )
         ctx_ms = (time.perf_counter() - t0) * 1000.0
@@ -992,7 +1106,7 @@ def execute_traced_query(
         )
 
         total_ms = (time.perf_counter() - run_t0) * 1000.0
-        retrieve_total_ms = round(embed_ms + dense_ms + bm25_ms + rrf_ms + rerank_ms, 2)
+        retrieve_total_ms = round(sql_ms + embed_ms + dense_ms + bm25_ms + rrf_ms + rerank_ms, 2)
         manager.finish_run(
             run_id,
             status="completed",

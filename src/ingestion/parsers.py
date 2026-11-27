@@ -30,20 +30,73 @@ class ParsedSection:
 _MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
 _TXT_SECTION_RE = re.compile(r"^\[(.+?)\]\s*$", re.MULTILINE)
 
+# Binary file signatures ("magic bytes") for formats where a wrong extension would crash the parser.
+_PDF_MAGIC = b"%PDF-"
+_ZIP_MAGIC = b"PK\x03\x04"  # .xlsx / .xlsm are ZIP (OOXML) containers
+_PDF_HEADER_SCAN_BYTES = 1024  # PDF spec tolerates leading junk before %PDF- within the first 1 KB
+
+# Scanned-PDF OCR fallback settings
+_PDF_OCR_DPI = 200
+_MIN_ALNUM_FOR_TEXT_LAYER = 3
+
+
+def validate_file_signature(file_path: Path) -> None:
+    """Verify binary headers for PDF and Excel files; raise ValueError on mismatch or empty file."""
+    suffix = file_path.suffix.lower()
+    if suffix not in (".pdf", ".xlsx", ".xlsm"):
+        return
+    if not file_path.exists() or file_path.stat().st_size == 0:
+        raise ValueError(f"Empty or missing file: {file_path.name}")
+    with file_path.open("rb") as handle:
+        head = handle.read(_PDF_HEADER_SCAN_BYTES)
+    if suffix == ".pdf" and _PDF_MAGIC not in head:
+        raise ValueError(f"'{file_path.name}' does not have a valid PDF signature (%PDF-)")
+    if suffix in (".xlsx", ".xlsm") and not head.startswith(_ZIP_MAGIC):
+        raise ValueError(f"'{file_path.name}' is not a valid Excel OOXML (ZIP) workbook")
+
+
+def _alnum_count(text: str) -> int:
+    return sum(1 for ch in text if ch.isalnum())
+
+
+def _ocr_pdf_page(page: "pymupdf.Page") -> str:
+    """Render a PDF page to RGB pixels and extract spatially ordered text via RapidOCR."""
+    pix = page.get_pixmap(dpi=_PDF_OCR_DPI, colorspace=pymupdf.csRGB, alpha=False)
+    rgb_arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    if pix.n > 3:
+        rgb_arr = rgb_arr[:, :, :3]
+    ocr_results, _ = get_ocr_engine()(np.ascontiguousarray(rgb_arr))
+    return _reconstruct_spatial_lines(ocr_results) if ocr_results else ""
+
 
 def parse_pdf(file_path: Path) -> list[ParsedSection]:
-    """Extract text page-by-page from a PDF using PyMuPDF."""
+    """Extract text page-by-page via PyMuPDF, OCR-ing scanned pages that have no text layer."""
+    validate_file_signature(file_path)
     sections: list[ParsedSection] = []
     source_name = file_path.name
     with pymupdf.open(file_path) as doc:
         for page_num, page in enumerate(doc, start=1):
             page_text = page.get_text("text").strip()
-            if page_text:
+            if _alnum_count(page_text) >= _MIN_ALNUM_FOR_TEXT_LAYER:
                 sections.append(
                     ParsedSection(
                         source_file=source_name,
                         page_or_section=f"Page {page_num}",
                         text=page_text,
+                    )
+                )
+                continue
+
+            # No usable text layer: OCR only if the page actually contains raster images (scans)
+            if not page.get_images(full=True):
+                continue
+            ocr_text = _ocr_pdf_page(page).strip()
+            if _alnum_count(ocr_text) >= _MIN_ALNUM_FOR_TEXT_LAYER:
+                sections.append(
+                    ParsedSection(
+                        source_file=source_name,
+                        page_or_section=f"Page {page_num} (OCR)",
+                        text=ocr_text,
                     )
                 )
     return sections
@@ -205,6 +258,7 @@ def parse_csv(file_path: Path, rows_per_section: int = 3) -> list[ParsedSection]
 
 def parse_excel(file_path: Path, rows_per_section: int = 3) -> list[ParsedSection]:
     """Parse multi-sheet Excel (.xlsx/.xlsm) workbooks into header-annotated sections."""
+    validate_file_signature(file_path)
     source_name = file_path.name
     sections: list[ParsedSection] = []
     workbook = openpyxl.load_workbook(file_path, read_only=True, data_only=True)

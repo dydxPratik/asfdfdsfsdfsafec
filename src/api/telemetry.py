@@ -30,6 +30,7 @@ INGESTION_STAGE_DEFS: list[dict[str, str]] = [
 
 QUERY_STAGE_DEFS: list[dict[str, str]] = [
     {"id": "query_input", "label": "Query Input & Config", "group": "input"},
+    {"id": "tabular_sql", "label": "DuckDB SQL Router", "group": "routing"},
     {"id": "query_embedding", "label": "Query Embedding (384-d)", "group": "encoding"},
     {"id": "dense_retrieval", "label": "ChromaDB Dense Search", "group": "retrieval"},
     {"id": "bm25_retrieval", "label": "BM25 Keyword Search", "group": "retrieval"},

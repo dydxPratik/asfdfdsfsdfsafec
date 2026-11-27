@@ -65,6 +65,11 @@ const STAGE_DESCRIPTIONS: Record<string, { title: string; module: string; summar
     module: 'src/retrieval/hybrid_retriever.py',
     summary: 'Validates query string, retrieval K parameters, and active ChromaDB collection document count.',
   },
+  tabular_sql: {
+    title: 'DuckDB Tabular SQL Router',
+    module: 'src/retrieval/tabular_sql.py',
+    summary: 'Routes CSV/Excel counting & aggregation questions to an in-memory read-only DuckDB SQL query.',
+  },
   query_embedding: {
     title: 'Asymmetric Query Embedding',
     module: 'src/retrieval/hybrid_retriever.py',
@@ -228,6 +233,28 @@ export const StageInspector: React.FC<StageInspectorProps> = ({ stageId, activeR
             </div>
 
             {/* Stage-Specific Rich Views */}
+            {stageId === 'tabular_sql' && (
+              <div className="space-y-2.5">
+                <div className="grid grid-cols-2 gap-2">
+                  <KV label="Engine" value={meta.engine || 'DuckDB In-Memory'} />
+                  <KV label="Rows Returned" value={meta.row_count ?? '—'} />
+                </div>
+                {meta.sql_query && (
+                  <>
+                    <div className="font-semibold text-zinc-800 dark:text-zinc-200">Executed SQL</div>
+                    <pre className="whitespace-pre-wrap rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-950 p-2.5 font-mono text-[10px] text-emerald-300">
+                      {meta.sql_query}
+                    </pre>
+                  </>
+                )}
+                {Array.isArray(meta.rows) && (
+                  <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-950 p-2.5 font-mono text-[10px] text-zinc-300">
+                    {JSON.stringify(meta.rows, null, 2)}
+                  </pre>
+                )}
+              </div>
+            )}
+
             {stageId === 'document_parser' && Array.isArray(meta.files_parsed) && (
               <div className="space-y-2">
                 <div className="font-semibold text-zinc-800 dark:text-zinc-200">Parsed Source Files</div>

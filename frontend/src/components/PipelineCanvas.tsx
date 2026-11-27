@@ -40,7 +40,7 @@ interface BlueprintNode {
  */
 const INGESTION_BLUEPRINT: BlueprintNode[] = [
   { id: 'file_upload', label: '1. File Upload', subtitle: './data scanner', pipeline: 'ingestion', x: 15, y: 52 },
-  { id: 'file_validation', label: '2. File Validation', subtitle: 'Magic bytes & size', pipeline: 'ingestion', x: 250, y: 52 },
+  { id: 'file_validation', label: '2. File Validation', subtitle: 'Header signature check', pipeline: 'ingestion', x: 250, y: 52 },
   { id: 'document_parser', label: '3a. Document Parser', subtitle: 'PyMuPDF / OpenPyXL', pipeline: 'ingestion', x: 485, y: 0 },
   { id: 'ocr_extraction', label: '3b. Spatial OCR', subtitle: 'RapidOCR (images)', pipeline: 'ingestion', x: 485, y: 108 },
   { id: 'recursive_chunking', label: '4. Recursive Chunker', subtitle: '700c / 120c overlap', pipeline: 'ingestion', x: 720, y: 52 },
@@ -65,6 +65,7 @@ const INGESTION_EDGES: Array<[string, string]> = [
  */
 const QUERY_BLUEPRINT: BlueprintNode[] = [
   { id: 'query_input', label: '1. User Query', subtitle: 'Prompt & Top-N', pipeline: 'query', x: 15, y: 45 },
+  { id: 'tabular_sql', label: '2c. DuckDB SQL', subtitle: 'CSV/Excel Router', pipeline: 'query', x: 250, y: 192, sourcePos: Position.Right },
   { id: 'query_embedding', label: '2a. Query Embedding', subtitle: 'BGE 384-d vector', pipeline: 'query', x: 250, y: 0 },
   { id: 'dense_retrieval', label: '3a. ChromaDB Search', subtitle: 'Dense cosine Top-K', pipeline: 'query', x: 485, y: 0 },
   { id: 'bm25_retrieval', label: '2b. BM25 Search', subtitle: 'Exact keyword Top-K', pipeline: 'query', x: 368, y: 98 },
@@ -77,6 +78,8 @@ const QUERY_BLUEPRINT: BlueprintNode[] = [
 
 const QUERY_EDGES: Array<[string, string]> = [
   ['query_input', 'query_embedding'],
+  ['query_input', 'tabular_sql'],
+  ['tabular_sql', 'context_assembly'],
   ['query_embedding', 'dense_retrieval'],
   ['query_input', 'bm25_retrieval'],
   ['dense_retrieval', 'rrf_fusion'],
@@ -114,6 +117,8 @@ function extractBadge(stageId: string, st?: StageState): string | null {
       return m.bm25_doc_count !== undefined ? `${m.bm25_doc_count} docs` : null;
     case 'query_input':
       return m.indexed_chunks_available !== undefined ? `${m.indexed_chunks_available} idx` : null;
+    case 'tabular_sql':
+      return m.row_count !== undefined ? `${m.row_count} rows` : null;
     case 'query_embedding':
       return m.dimensions ? `${m.dimensions}-d` : null;
     case 'dense_retrieval':

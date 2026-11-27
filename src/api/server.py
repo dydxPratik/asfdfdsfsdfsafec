@@ -32,15 +32,18 @@ from src.config import (
     CHUNK_SIZE,
     COLLECTION_NAME,
     DATA_DIR,
+    DEFAULT_EMBEDDING_PROFILE,
     DEFAULT_GROQ_MODEL,
     DENSE_TOP_K,
     EMBEDDING_MODEL_NAME,
+    EMBEDDING_PROFILES,
     FLASHRANK_MODEL_NAME,
     IMAGE_EXTENSIONS,
     PROJECT_ROOT,
     RERANK_TOP_N,
     RRF_K,
     SUPPORTED_EXTENSIONS,
+    SUPPORTED_RESPONSE_LANGUAGES,
 )
 from src.ingestion.indexer import (
     get_chroma_client,
@@ -54,12 +57,16 @@ from src.retrieval.hybrid_retriever import get_reranker, reciprocal_rank_fusion
 
 EVAL_CACHE_PATH: Path = CHROMA_DIR / "latest_eval_benchmark.json"
 FRONTEND_DIST: Path = PROJECT_ROOT / "frontend" / "dist"
+MAX_UPLOAD_BYTES: int = 25 * 1024 * 1024  # 25 MB per uploaded file
 
 run_manager = RunManager()
+_INGEST_LOCK = threading.Lock()
 
 # Mutable runtime settings initialized from src.config
 RUNTIME_SETTINGS: dict[str, Any] = {
     "default_groq_model": DEFAULT_GROQ_MODEL,
+    "embedding_profile": DEFAULT_EMBEDDING_PROFILE,
+    "response_language": SUPPORTED_RESPONSE_LANGUAGES[0],
     "dense_top_k": DENSE_TOP_K,
     "bm25_top_k": BM25_TOP_K,
     "rrf_k": RRF_K,
@@ -72,6 +79,8 @@ RUNTIME_SETTINGS: dict[str, Any] = {
 class QueryStartRequest(BaseModel):
     query: str = Field(..., min_length=1)
     model: str | None = None
+    response_language: str | None = None
+    embedding_profile: str | None = None
     top_n: int | None = Field(default=None, ge=1, le=20)
     dense_top_k: int | None = Field(default=None, ge=1, le=50)
     bm25_top_k: int | None = Field(default=None, ge=1, le=50)
@@ -88,6 +97,8 @@ class RetrievalExploreRequest(BaseModel):
 
 class RuntimeSettingsUpdate(BaseModel):
     default_groq_model: str | None = None
+    embedding_profile: str | None = None
+    response_language: str | None = None
     dense_top_k: int | None = Field(default=None, ge=1, le=50)
     bm25_top_k: int | None = Field(default=None, ge=1, le=50)
     rrf_k: int | None = Field(default=None, ge=1, le=200)
@@ -105,7 +116,8 @@ def _warm_and_ensure_index() -> None:
     client = get_chroma_client(CHROMA_DIR)
     col = get_or_create_collection(client)
     if files and (col.count() == 0 or not BM25_CORPUS_PATH.exists()):
-        ingest_directory(data_dir=DATA_DIR, chroma_dir=CHROMA_DIR, corpus_path=BM25_CORPUS_PATH, reset_index=True)
+        with _INGEST_LOCK:
+            ingest_directory(data_dir=DATA_DIR, chroma_dir=CHROMA_DIR, corpus_path=BM25_CORPUS_PATH, reset_index=True)
 
 
 @asynccontextmanager
@@ -122,9 +134,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    # Only the local Vite dev server needs cross-origin access; production UI is same-origin
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -157,6 +170,8 @@ def api_health() -> dict[str, Any]:
         "source_files": len(files),
         "supported_extensions": list(SUPPORTED_EXTENSIONS),
         "available_groq_models": list(AVAILABLE_GROQ_MODELS),
+        "embedding_profiles": EMBEDDING_PROFILES,
+        "supported_response_languages": list(SUPPORTED_RESPONSE_LANGUAGES),
         "settings": RUNTIME_SETTINGS,
         "stage_definitions": {
             "ingestion": INGESTION_STAGE_DEFS,
@@ -244,52 +259,77 @@ async def api_start_ingestion(
     reset_index: bool = Form(default=True),
     files: list[UploadFile] | None = File(default=None),
 ) -> dict[str, Any]:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    saved_names: list[str] = []
-    if files:
-        for uf in files:
-            if not uf.filename:
-                continue
-            safe_name = Path(uf.filename).name
-            ext = Path(safe_name).suffix.lower()
-            if ext not in SUPPORTED_EXTENSIONS:
-                raise HTTPException(status_code=400, detail=f"Unsupported file extension '{ext}'")
-            content = await uf.read()
+    # Only one ingestion may rewrite ChromaDB + BM25 at a time
+    if not _INGEST_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="An indexing run is already in progress. Please wait for it to finish.")
+
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        pending: list[tuple[str, bytes]] = []
+        if files:
+            for uf in files:
+                if not uf.filename:
+                    continue
+                safe_name = Path(uf.filename).name
+                ext = Path(safe_name).suffix.lower()
+                if not Path(safe_name).stem or ext not in SUPPORTED_EXTENSIONS:
+                    raise HTTPException(status_code=400, detail=f"Unsupported or invalid file '{safe_name}'")
+                content = await uf.read()
+                if len(content) > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"'{safe_name}' exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit",
+                    )
+                pending.append((safe_name, content))
+
+        # Write only after every file in the batch passed validation
+        saved_names: list[str] = []
+        for safe_name, content in pending:
             (DATA_DIR / safe_name).write_bytes(content)
             saved_names.append(safe_name)
+    except BaseException:
+        _INGEST_LOCK.release()
+        raise
 
     title = (
         f"Ingest {len(saved_names)} uploaded file(s)"
         if saved_names
         else ("Full Knowledge Base Re-Index" if reset_index else "Incremental Knowledge Base Sync")
     )
-    run_rec = run_manager.create_run(
-        pipeline_type="ingestion",
-        title=title,
-        params={
-            "reset_index": reset_index,
-            "uploaded_files": saved_names,
-            "chunk_size": RUNTIME_SETTINGS["chunk_size"],
-            "chunk_overlap": RUNTIME_SETTINGS["chunk_overlap"],
-        },
-    )
-    run_id = run_rec["run_id"]
+    try:
+        run_rec = run_manager.create_run(
+            pipeline_type="ingestion",
+            title=title,
+            params={
+                "reset_index": reset_index,
+                "uploaded_files": saved_names,
+                "chunk_size": RUNTIME_SETTINGS["chunk_size"],
+                "chunk_overlap": RUNTIME_SETTINGS["chunk_overlap"],
+            },
+        )
+        run_id = run_rec["run_id"]
 
-    threading.Thread(
-        target=execute_traced_ingestion,
-        kwargs={
-            "run_id": run_id,
-            "manager": run_manager,
-            "data_dir": DATA_DIR,
-            "chroma_dir": CHROMA_DIR,
-            "corpus_path": BM25_CORPUS_PATH,
-            "chunk_size": RUNTIME_SETTINGS["chunk_size"],
-            "chunk_overlap": RUNTIME_SETTINGS["chunk_overlap"],
-            "reset_index": reset_index,
-            "uploaded_filenames": saved_names,
-        },
-        daemon=True,
-    ).start()
+        def _locked_ingestion() -> None:
+            try:
+                execute_traced_ingestion(
+                    run_id=run_id,
+                    manager=run_manager,
+                    data_dir=DATA_DIR,
+                    chroma_dir=CHROMA_DIR,
+                    corpus_path=BM25_CORPUS_PATH,
+                    chunk_size=RUNTIME_SETTINGS["chunk_size"],
+                    chunk_overlap=RUNTIME_SETTINGS["chunk_overlap"],
+                    reset_index=reset_index,
+                    uploaded_filenames=saved_names,
+                    embedding_profile=RUNTIME_SETTINGS["embedding_profile"],
+                )
+            finally:
+                _INGEST_LOCK.release()
+
+        threading.Thread(target=_locked_ingestion, daemon=True).start()
+    except BaseException:
+        _INGEST_LOCK.release()
+        raise
 
     return {"run_id": run_id, "run": run_rec}
 
@@ -297,6 +337,8 @@ async def api_start_ingestion(
 @app.post("/api/query/start")
 async def api_start_query(req: QueryStartRequest) -> dict[str, Any]:
     model = req.model or RUNTIME_SETTINGS["default_groq_model"]
+    response_language = req.response_language or RUNTIME_SETTINGS["response_language"]
+    embedding_profile = req.embedding_profile or RUNTIME_SETTINGS["embedding_profile"]
     top_n = req.top_n or RUNTIME_SETTINGS["rerank_top_n"]
     dense_k = req.dense_top_k or RUNTIME_SETTINGS["dense_top_k"]
     bm25_k = req.bm25_top_k or RUNTIME_SETTINGS["bm25_top_k"]
@@ -308,6 +350,8 @@ async def api_start_query(req: QueryStartRequest) -> dict[str, Any]:
         params={
             "query": req.query.strip(),
             "model": model,
+            "response_language": response_language,
+            "embedding_profile": embedding_profile,
             "top_n": top_n,
             "dense_top_k": dense_k,
             "bm25_top_k": bm25_k,
@@ -323,6 +367,8 @@ async def api_start_query(req: QueryStartRequest) -> dict[str, Any]:
             "manager": run_manager,
             "query": req.query,
             "model": model,
+            "response_language": response_language,
+            "embedding_profile": embedding_profile,
             "top_n": top_n,
             "dense_top_k": dense_k,
             "bm25_top_k": bm25_k,

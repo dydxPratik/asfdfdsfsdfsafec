@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
+import unicodedata
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -19,7 +22,9 @@ from src.config import (
     CHUNK_SIZE,
     COLLECTION_NAME,
     DATA_DIR,
+    DEFAULT_EMBEDDING_PROFILE,
     EMBEDDING_MODEL_NAME,
+    EMBEDDING_PROFILES,
     IMAGE_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
 )
@@ -27,25 +32,40 @@ from src.ingestion.chunker import make_chunk_id, recursive_split_text
 from src.ingestion.parsers import parse_file
 from src.schemas import ChunkMetadata, DocumentChunk
 
-# Keep hyphenated IDs (e.g. pol-exp-402, nv-emp-1042) AND individual alphanumeric sub-tokens
-_TOKEN_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+def _is_word_char(ch: str) -> bool:
+    return ch.isalnum() or unicodedata.category(ch).startswith("M")
 
 
 def tokenize_for_bm25(text: str) -> list[str]:
-    """Tokenize text preserving exact hyphenated company codes/IDs plus sub-parts."""
-    lowered = text.lower()
+    """Tokenize text preserving hyphenated IDs and all Unicode scripts (including combining marks)."""
+    lowered = unicodedata.normalize("NFC", text).lower()
+    raw_tokens: list[str] = []
+    buf: list[str] = []
+    for ch in lowered:
+        if _is_word_char(ch) or (ch == "-" and buf):
+            buf.append(ch)
+        else:
+            if buf:
+                tok = "".join(buf).rstrip("-")
+                if tok:
+                    raw_tokens.append(tok)
+                buf.clear()
+    if buf:
+        tok = "".join(buf).rstrip("-")
+        if tok:
+            raw_tokens.append(tok)
+
     tokens: list[str] = []
-    for match in _TOKEN_RE.finditer(lowered):
-        tok = match.group(0)
+    for tok in raw_tokens:
         tokens.append(tok)
         if "-" in tok:
             tokens.extend(part for part in tok.split("-") if part)
     return tokens
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=4)
 def get_embedding_model(model_name: str = EMBEDDING_MODEL_NAME) -> SentenceTransformer:
-    """Load and cache the local CPU SentenceTransformer model."""
+    """Load and cache a local CPU SentenceTransformer model."""
     return SentenceTransformer(model_name, device="cpu")
 
 
@@ -108,17 +128,61 @@ class IngestionReport:
     failed_files: dict[str, str] = field(default_factory=dict)
 
 
+# In-memory BM25 cache keyed by corpus path -> (file signature, index, records).
+# Avoids re-reading JSON and rebuilding BM25Okapi on every query.
+_BM25_CACHE: dict[str, tuple[tuple[int, int], BM25Okapi | None, list[dict]]] = {}
+_BM25_CACHE_LOCK = threading.Lock()
+
+
+def _cache_key(corpus_path: Path) -> str:
+    return str(Path(corpus_path).resolve())
+
+
+def invalidate_bm25_cache(corpus_path: Path | None = None) -> None:
+    """Drop cached BM25 index for one corpus path (or all paths when None)."""
+    with _BM25_CACHE_LOCK:
+        if corpus_path is None:
+            _BM25_CACHE.clear()
+        else:
+            _BM25_CACHE.pop(_cache_key(corpus_path), None)
+
+
+def save_bm25_corpus(records: list[dict], corpus_path: Path = BM25_CORPUS_PATH) -> None:
+    """Atomically persist BM25 records (temp file + os.replace) and invalidate the cache."""
+    corpus_path = Path(corpus_path)
+    corpus_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = corpus_path.with_name(corpus_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+    os.replace(tmp_path, corpus_path)
+    invalidate_bm25_cache(corpus_path)
+
+
 def load_bm25_index(
     corpus_path: Path = BM25_CORPUS_PATH,
 ) -> tuple[BM25Okapi | None, list[dict]]:
-    """Load persisted BM25 corpus records and instantiate BM25Okapi."""
+    """Load persisted BM25 corpus records and BM25Okapi, cached until the file changes."""
+    corpus_path = Path(corpus_path)
     if not corpus_path.exists():
         return None, []
+    stat = corpus_path.stat()
+    signature = (stat.st_mtime_ns, stat.st_size)
+    key = _cache_key(corpus_path)
+
+    with _BM25_CACHE_LOCK:
+        cached = _BM25_CACHE.get(key)
+        if cached is not None and cached[0] == signature:
+            return cached[1], cached[2]
+
     records: list[dict] = json.loads(corpus_path.read_text(encoding="utf-8"))
-    if not records:
-        return None, []
-    tokenized_corpus = [rec["tokens"] for rec in records]
-    return BM25Okapi(tokenized_corpus), records
+    index: BM25Okapi | None = None
+    if records:
+        index = BM25Okapi([rec["tokens"] for rec in records])
+    else:
+        records = []
+
+    with _BM25_CACHE_LOCK:
+        _BM25_CACHE[key] = (signature, index, records)
+    return index, records
 
 
 def ingest_directory(
@@ -128,6 +192,7 @@ def ingest_directory(
     chunk_size: int = CHUNK_SIZE,
     chunk_overlap: int = CHUNK_OVERLAP,
     reset_index: bool = True,
+    embedding_profile: str = DEFAULT_EMBEDDING_PROFILE,
 ) -> IngestionReport:
     """Parse, chunk, embed, and persist all supported company files into ChromaDB + BM25."""
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -166,10 +231,13 @@ def ingest_directory(
 
     embedding_dim = 0
     if all_chunks:
-        embedder = get_embedding_model()
+        prof = EMBEDDING_PROFILES.get(embedding_profile, EMBEDDING_PROFILES[DEFAULT_EMBEDDING_PROFILE])
+        embedder = get_embedding_model(prof["model_name"])
         texts = [c.text for c in all_chunks]
+        p_prefix = prof.get("passage_prefix", "")
+        encode_inputs = [p_prefix + t for t in texts] if p_prefix else texts
         embeddings_np = embedder.encode(
-            texts,
+            encode_inputs,
             batch_size=32,
             show_progress_bar=False,
             convert_to_numpy=True,
@@ -213,8 +281,7 @@ def ingest_directory(
         ]
         bm25_records = kept_records + new_records
 
-    corpus_path.parent.mkdir(parents=True, exist_ok=True)
-    corpus_path.write_text(json.dumps(bm25_records, indent=2), encoding="utf-8")
+    save_bm25_corpus(bm25_records, corpus_path)
 
     bm25_index, loaded_records = load_bm25_index(corpus_path)
     bm25_count = len(loaded_records) if bm25_index is not None else 0

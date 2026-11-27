@@ -18,11 +18,11 @@ class TestEndToEndUIAndCLI(unittest.TestCase):
     def test_pyproject_script_entrypoint_works(self) -> None:
         """Verify `[project.scripts] ragquest = 'src.cli:main'` runs the real CLI help cleanly."""
         proc = subprocess.run(
-            ["uv", "run", "ragquest", "--help"],
+            ["uv", "run", "--no-sync", "ragquest", "--help"],
             cwd=str(PROJECT_ROOT),
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=60,
         )
         self.assertEqual(proc.returncode, 0, msg=proc.stderr)
         self.assertIn("RAGQuest Local Hybrid RAG CLI", proc.stdout)

@@ -79,6 +79,8 @@ export interface RunSummary {
 
 export interface RuntimeSettings {
   default_groq_model: string;
+  embedding_profile?: string;
+  response_language?: string;
   dense_top_k: number;
   bm25_top_k: number;
   rrf_k: number;
@@ -99,6 +101,8 @@ export interface HealthResponse {
   source_files: number;
   supported_extensions: string[];
   available_groq_models: string[];
+  embedding_profiles?: Record<string, { model_name: string; label: string }>;
+  supported_response_languages?: string[];
   settings: RuntimeSettings;
 }
 

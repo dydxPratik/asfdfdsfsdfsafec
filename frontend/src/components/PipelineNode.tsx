@@ -46,6 +46,7 @@ const STAGE_ICONS: Record<string, React.ComponentType<{ className?: string }>> =
   vector_db_indexing: Database,
   bm25_indexing: FileCode2,
   query_input: FileSearch,
+  tabular_sql: Database,
   query_embedding: Cpu,
   dense_retrieval: Database,
   bm25_retrieval: Filter,

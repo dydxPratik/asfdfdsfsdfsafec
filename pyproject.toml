@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "chromadb>=1.5.9",
+    "duckdb>=2.0.1",
     "fastapi>=0.165.0",
     "flashrank>=0.2.10",
     "groq>=1.7.0",
@@ -32,3 +33,15 @@ module-root = ""
 [build-system]
 requires = ["uv_build>=0.13.8,<0.14.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+markers = [
+    "live_llm: marks tests that make live network calls to the Groq LLM API",
+]

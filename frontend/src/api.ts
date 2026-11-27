@@ -50,6 +50,8 @@ export async function startIngestionRun(files: File[], resetIndex: boolean): Pro
 export async function startQueryRun(params: {
   query: string;
   model?: string;
+  response_language?: string;
+  embedding_profile?: string;
   top_n?: number;
   dense_top_k?: number;
   bm25_top_k?: number;

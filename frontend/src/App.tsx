@@ -24,6 +24,7 @@ import {
   startIngestionRun,
   startQueryRun,
   subscribeToRunStream,
+  updateRuntimeSettings,
 } from './api';
 import {
   DocumentItem,
@@ -63,6 +64,8 @@ export const App: React.FC = () => {
   // Sidebar RAG controls (matching original app.py)
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>('openai/gpt-oss-120b');
+  const [responseLanguage, setResponseLanguage] = useState<string>('Auto (Match Query)');
+  const [embeddingProfile, setEmbeddingProfile] = useState<string>('english');
   const [topN, setTopN] = useState<number>(5);
   const [showDebug, setShowDebug] = useState<boolean>(true);
   const [statusBanner, setStatusBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -87,13 +90,20 @@ export const App: React.FC = () => {
     document.documentElement.classList.toggle('dark', darkMode);
   }, [darkMode]);
 
+  const settingsAppliedRef = useRef(false);
+
   const refreshStats = useCallback(async () => {
     try {
       const [h, d] = await Promise.all([fetchHealth(), fetchDocuments()]);
       setHealth(h);
       setDocuments(d.documents);
-      if (h.settings?.default_groq_model) {
-        setSelectedModel((prev) => prev || h.settings.default_groq_model);
+      // Initialize sidebar controls from backend config once (config.py is the single source of truth)
+      if (!settingsAppliedRef.current && h.settings) {
+        settingsAppliedRef.current = true;
+        if (h.settings.default_groq_model) setSelectedModel(h.settings.default_groq_model);
+        if (h.settings.response_language) setResponseLanguage(h.settings.response_language);
+        if (h.settings.embedding_profile) setEmbeddingProfile(h.settings.embedding_profile);
+        if (h.settings.rerank_top_n) setTopN(Math.min(10, Math.max(3, h.settings.rerank_top_n)));
       }
     } catch {
       // ignore transient startup poll error
@@ -205,6 +215,8 @@ export const App: React.FC = () => {
       const { run_id, run } = await startQueryRun({
         query: trimmed,
         model: selectedModel,
+        response_language: responseLanguage,
+        embedding_profile: embeddingProfile,
         top_n: topN,
       });
       setActiveRun(run);
@@ -407,6 +419,58 @@ export const App: React.FC = () => {
                     </option>
                   )
                 )}
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                Response Language
+              </label>
+              <select
+                value={responseLanguage}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setResponseLanguage(val);
+                  updateRuntimeSettings({ response_language: val }).catch(() => {});
+                }}
+                className="w-full rounded-lg border border-zinc-300 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 px-2.5 py-1.5 text-xs text-zinc-900 dark:text-zinc-100 focus:border-indigo-500 focus:outline-none"
+              >
+                {(
+                  health?.supported_response_languages || [
+                    'Auto (Match Query)',
+                    'English',
+                    'Hindi',
+                    'Spanish',
+                    'French',
+                    'German',
+                  ]
+                ).map((lang) => (
+                  <option key={lang} value={lang}>
+                    {lang}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                Embedding Profile
+              </label>
+              <select
+                value={embeddingProfile}
+                onChange={(e) => {
+                  const prof = e.target.value;
+                  setEmbeddingProfile(prof);
+                  updateRuntimeSettings({ embedding_profile: prof }).catch(() => {});
+                  setStatusBanner({
+                    type: 'success',
+                    text: 'Embedding profile updated — click Save & Re-Index to rebuild vectors.',
+                  });
+                }}
+                className="w-full rounded-lg border border-zinc-300 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900 px-2.5 py-1.5 text-xs text-zinc-900 dark:text-zinc-100 focus:border-indigo-500 focus:outline-none"
+              >
+                <option value="english">English Fast (bge-small)</option>
+                <option value="multilingual">Multilingual 100+ Langs (e5-small)</option>
               </select>
             </div>
 

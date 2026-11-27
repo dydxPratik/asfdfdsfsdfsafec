@@ -26,14 +26,15 @@ STRICT GROUNDING & SECURITY RULES:
    - Set "confidence" to "low".
    - Set "citations" to [].
    - Explicitly state in "answer" that this information is not found (or is illegible) in the provided company documents/images.
-3. If the answer IS fully supported by <retrieved_company_chunks>:
+4. If the answer IS fully supported by <retrieved_company_chunks>:
    - Set "is_supported" to true and "confidence" to "high".
    - Provide concise, accurate details matching exact numbers, codes, dates, and conditions in the text.
-   - Populate "citations" with entries where "source_file" is the exact filename from the chunk header and "quote" is an exact verbatim excerpt copied from that chunk.
-4. If the user asks a multi-part question and some parts ARE explicitly answered in <retrieved_company_chunks> while another part is missing:
+   - Populate "citations" with entries where "source_file" is the exact filename from the chunk header and "quote" is an exact verbatim excerpt copied from that chunk in its original language.
+5. If the user asks a multi-part question and some parts ARE explicitly answered in <retrieved_company_chunks> while another part is missing:
    - Answer every supported part accurately with exact "citations", and explicitly note which sub-question is not covered in the retrieved chunks (never guess it).
    - Set "is_supported" to true and "confidence" to "medium".
-5. Output valid JSON matching the required schema with keys: "answer", "citations", "is_supported", "confidence"."""
+6. MULTILINGUAL RULE: Write the "answer" in the requested response language (or match the user's question language when set to Auto), while ALWAYS keeping every "citation.quote" as an exact verbatim substring from the retrieved chunk.
+7. Output valid JSON matching the required schema with keys: "answer", "citations", "is_supported", "confidence"."""
 
 
 def get_groq_client() -> Groq:
@@ -92,6 +93,7 @@ def generate_grounded_answer(
     query: str,
     retrieved_chunks: list[RetrievedChunk],
     model: str = DEFAULT_GROQ_MODEL,
+    response_language: str = "Auto (Match Query)",
 ) -> RAGResponse:
     """Generate a strictly grounded, Pydantic-validated RAGResponse from retrieved chunks."""
     if not retrieved_chunks:
@@ -106,13 +108,20 @@ def generate_grounded_answer(
     context_xml = format_chunks_for_prompt(retrieved_chunks)
     schema_dict = RAGResponse.model_json_schema()
 
+    lang_instruction = (
+        f"Write the 'answer' in {response_language} (keeping 'citations[].quote' verbatim from the source text)."
+        if response_language and not response_language.lower().startswith("auto")
+        else "Write the 'answer' in the same language as the User Question (keeping 'citations[].quote' verbatim from the source text)."
+    )
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "user",
             "content": (
                 f"{context_xml}\n\n"
-                f"User Question: {query}\n\n"
+                f"User Question: {query}\n"
+                f"Language Directive: {lang_instruction}\n\n"
                 "Respond strictly in JSON matching the RAGResponse schema."
             ),
         },
@@ -215,7 +224,33 @@ def answer_question(
     top_n: int = RERANK_TOP_N,
     model: str = DEFAULT_GROQ_MODEL,
 ) -> tuple[RAGResponse, list[RetrievedChunk]]:
-    """End-to-end RAG pipeline: Hybrid Retrieve + FlashRank Rerank + Grounded Groq Answer."""
+    """End-to-end RAG pipeline: DuckDB SQL Router (for tabular aggregations) or Hybrid Retrieve + FlashRank -> Groq."""
+    from src.retrieval.tabular_sql import (
+        execute_tabular_sql_query,
+        load_tabular_connection,
+        should_route_to_tabular_sql,
+    )
+
+    conn, tables = load_tabular_connection()
+    try:
+        if should_route_to_tabular_sql(query, tables):
+            try:
+                sql_res = execute_tabular_sql_query(
+                    query=query,
+                    conn=conn,
+                    tables=tables,
+                    groq_client=get_groq_client(),
+                    model=model,
+                )
+                chunks = sql_res["chunks"]
+                response = generate_grounded_answer(query=query, retrieved_chunks=chunks, model=model)
+                return response, chunks
+            except Exception:
+                # Fall back cleanly to Hybrid RAG if SQL routing/execution does not succeed
+                pass
+    finally:
+        conn.close()
+
     chunks = hybrid_retrieve_and_rerank(query=query, top_n=top_n)
     response = generate_grounded_answer(query=query, retrieved_chunks=chunks, model=model)
     return response, chunks

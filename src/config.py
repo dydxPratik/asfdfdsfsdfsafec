@@ -17,6 +17,30 @@ COLLECTION_NAME: str = "company_knowledge"
 # Local CPU Models
 EMBEDDING_MODEL_NAME: str = "BAAI/bge-small-en-v1.5"
 BGE_QUERY_PREFIX: str = "Represent this sentence for searching relevant passages: "
+MULTILINGUAL_EMBEDDING_MODEL_NAME: str = "intfloat/multilingual-e5-small"
+EMBEDDING_PROFILES: dict[str, dict[str, str]] = {
+    "english": {
+        "model_name": EMBEDDING_MODEL_NAME,
+        "query_prefix": BGE_QUERY_PREFIX,
+        "passage_prefix": "",
+        "label": "English Fast (bge-small-en-v1.5)",
+    },
+    "multilingual": {
+        "model_name": MULTILINGUAL_EMBEDDING_MODEL_NAME,
+        "query_prefix": "query: ",
+        "passage_prefix": "passage: ",
+        "label": "Multilingual 100+ Langs (multilingual-e5-small)",
+    },
+}
+DEFAULT_EMBEDDING_PROFILE: str = "english"
+SUPPORTED_RESPONSE_LANGUAGES: tuple[str, ...] = (
+    "Auto (Match Query)",
+    "English",
+    "Hindi",
+    "Spanish",
+    "French",
+    "German",
+)
 FLASHRANK_MODEL_NAME: str = "ms-marco-MiniLM-L-12-v2"
 
 # Chunking (tuned for 512-token context window of bge-small-en-v1.5 & MiniLM reranker)
